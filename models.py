@@ -27,7 +27,7 @@ with mlflow.start_run() as run:
         python_model=RiskModel(),
         signature=signature,
         input_example=X,
-        registered_model_name="hedgingsk-model"
+        registered_model_name="rihedgingsk-model"
     )
 
 print(f"Logged model to run {run.info.run_id}: {model_info.model_uri}")

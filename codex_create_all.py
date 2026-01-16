@@ -154,8 +154,37 @@ def parse_curl_command(curl_text: str) -> dict | None:
     return result if 'url' in result else None
 
 
-def infer_parameter_type(value: Any) -> str:
+def _split_param_tokens(name: str) -> list[str]:
+    """Split a parameter name into lowercase tokens for heuristics."""
+    if not name:
+        return []
+    tokens = re.findall(r"[A-Z]?[a-z]+|[0-9]+|[A-Z]+(?![a-z])", name)
+    if not tokens:
+        tokens = re.split(r"[^a-zA-Z0-9]+", name)
+    return [t.lower() for t in tokens if t]
+
+
+def _looks_like_date_string(value: str) -> bool:
+    """Detect common date formats like yyyy-mm-dd or ISO timestamps."""
+    if not value:
+        return False
+    return bool(re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}([ T].*)?$", value.strip()))
+
+
+def _is_date_param(name: str, value: Any) -> bool:
+    """Heuristic detection for date-like parameters."""
+    tokens = _split_param_tokens(name)
+    if any(t in {"date", "dt", "dob"} for t in tokens):
+        return True
+    if isinstance(value, str) and _looks_like_date_string(value):
+        return True
+    return False
+
+
+def infer_parameter_type(name: str, value: Any) -> str:
     """Infer the C# type from a Python value."""
+    if _is_date_param(name, value):
+        return "date"
     if isinstance(value, bool):
         return "bool"
     elif isinstance(value, int):
@@ -237,7 +266,7 @@ def discover_endpoints(project_id: str) -> list[EndpointConfig]:
         parameters = []
         if signature and 'data' in signature and isinstance(signature['data'], dict):
             for param_name, param_value in signature['data'].items():
-                param_type = infer_parameter_type(param_value)
+                param_type = infer_parameter_type(param_name, param_value)
                 parameters.append({
                     "name": param_name,
                     "type": param_type,
@@ -279,7 +308,8 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
     param_section_parts = []
     for p in endpoint.parameters:
         excel_arg = f'[ExcelArgument(Name = "{p["name"]}", Description = "{p["description"]}")]'
-        param_section_parts.append(f'{excel_arg} {p["type"]} {p["name"]}')
+        param_type = "object" if p["type"] == "date" else p["type"]
+        param_section_parts.append(f'{excel_arg} {param_type} {p["name"]}')
 
     param_section = ", ".join(param_section_parts)
 
@@ -297,6 +327,11 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
             # String parameters: "key": "value" with escaping
             # C# output: "\"key\": \"" + val.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""
             escaped_value = f'{param_name}.Replace("\\\\", "\\\\\\\\").Replace("\\"", "\\\\\\"")'
+            json_parts.append(f'"\\\"{param_name}\\\": \\"" + {escaped_value} + "\\"{separator}"')
+        elif p["type"] == "date":
+            escaped_value = (
+                f'FormatDateParam({param_name}).Replace("\\\\", "\\\\\\\\").Replace("\\"", "\\\\\\"")'
+            )
             json_parts.append(f'"\\\"{param_name}\\\": \\"" + {escaped_value} + "\\"{separator}"')
         elif p["type"] == "bool":
             # Boolean parameters: "key": true/false
@@ -381,6 +416,7 @@ def generate_csharp_code(endpoints: list[EndpointConfig]) -> str:
 
     code = f'''using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Text.RegularExpressions;
@@ -398,19 +434,91 @@ using ExcelDna.Integration;
 public static class DominoModelFunctions
 {{
     /// <summary>
+    /// Formats a date-like parameter into yyyy-MM-dd.
+    /// Accepts Excel dates, Unix epoch (seconds/ms), and date strings.
+    /// </summary>
+    private static string FormatDateParam(object value)
+    {{
+        if (value == null)
+        {{
+            return "";
+        }}
+        if (value is ExcelMissing || value is ExcelEmpty)
+        {{
+            return "";
+        }}
+
+        if (value is double d)
+        {{
+            return FormatDateFromNumber(d);
+        }}
+        if (value is int i)
+        {{
+            return FormatDateFromNumber(i);
+        }}
+        if (value is DateTime dt)
+        {{
+            return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }}
+        if (value is string s)
+        {{
+            s = s.Trim();
+            if (string.IsNullOrEmpty(s))
+            {{
+                return "";
+            }}
+
+            if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out double num))
+            {{
+                return FormatDateFromNumber(num);
+            }}
+
+            if (DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out DateTime parsed))
+            {{
+                return parsed.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            }}
+
+            return s;
+        }}
+
+        return value.ToString();
+    }}
+
+    private static string FormatDateFromNumber(double value)
+    {{
+        // Epoch milliseconds or seconds
+        if (value >= 1_000_000_000_000d)
+        {{
+            var dt = DateTimeOffset.FromUnixTimeMilliseconds((long)Math.Round(value)).DateTime;
+            return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }}
+        if (value >= 1_000_000_000d)
+        {{
+            var dt = DateTimeOffset.FromUnixTimeSeconds((long)Math.Round(value)).DateTime;
+            return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }}
+
+        try
+        {{
+            var dt = DateTime.FromOADate(value);
+            return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }}
+        catch
+        {{
+            return value.ToString(CultureInfo.InvariantCulture);
+        }}
+    }}
+
+    /// <summary>
     /// Extracts the "result" field from the JSON response and returns it as Excel-friendly output.
     /// Handles single values, 1D arrays (horizontal spill), and 2D arrays (grid spill).
     /// </summary>
     private static object ParseResult(string json)
     {{
-        // Find the "result" field using regex (lightweight, no external JSON dependency)
-        var resultMatch = Regex.Match(json, @"""result""\s*:\s*(\[[\s\S]*?\]|[^,\}}]+)");
-        if (!resultMatch.Success)
+        if (!TryExtractResultValue(json, out string resultValue, out string error))
         {{
-            return "Error: No result field in response";
+            return error;
         }}
-
-        string resultValue = resultMatch.Groups[1].Value.Trim();
 
         // Check if it's a 2D array (array of arrays) like [[1,2],[3,4]]
         if (resultValue.StartsWith("[["))
@@ -427,6 +535,126 @@ public static class DominoModelFunctions
             // Single value
             return ParseSingleValue(resultValue);
         }}
+    }}
+
+    /// <summary>
+    /// Extracts the raw JSON value for the "result" field without relying on regex for nested arrays.
+    /// </summary>
+    private static bool TryExtractResultValue(string json, out string resultValue, out string error)
+    {{
+        resultValue = "";
+        error = "";
+
+        var match = Regex.Match(json, @"""result""\s*:");
+        if (!match.Success)
+        {{
+            error = "Error: No result field in response";
+            return false;
+        }}
+
+        int i = match.Index + match.Length;
+        while (i < json.Length && char.IsWhiteSpace(json[i]))
+        {{
+            i++;
+        }}
+
+        if (i >= json.Length)
+        {{
+            error = "Error: Empty result field in response";
+            return false;
+        }}
+
+        char start = json[i];
+        if (start == '[' || start == '{{')
+        {{
+            char open = start;
+            char close = (start == '[') ? ']' : '}}';
+            int depth = 0;
+            bool inString = false;
+            bool escape = false;
+            int startIndex = i;
+
+            for (; i < json.Length; i++)
+            {{
+                char ch = json[i];
+                if (inString)
+                {{
+                    if (escape)
+                    {{
+                        escape = false;
+                        continue;
+                    }}
+                    if (ch == '\\\\')
+                    {{
+                        escape = true;
+                        continue;
+                    }}
+                    if (ch == '\"')
+                    {{
+                        inString = false;
+                    }}
+                    continue;
+                }}
+
+                if (ch == '\"')
+                {{
+                    inString = true;
+                    continue;
+                }}
+
+                if (ch == open)
+                {{
+                    depth++;
+                }}
+                else if (ch == close)
+                {{
+                    depth--;
+                    if (depth == 0)
+                    {{
+                        resultValue = json.Substring(startIndex, i - startIndex + 1).Trim();
+                        return true;
+                    }}
+                }}
+            }}
+
+            error = "Error: Unterminated result value in response";
+            return false;
+        }}
+
+        if (start == '\"')
+        {{
+            int startIndex = i;
+            bool escape = false;
+            for (i = i + 1; i < json.Length; i++)
+            {{
+                char ch = json[i];
+                if (escape)
+                {{
+                    escape = false;
+                    continue;
+                }}
+                if (ch == '\\\\')
+                {{
+                    escape = true;
+                    continue;
+                }}
+                if (ch == '\"')
+                {{
+                    resultValue = json.Substring(startIndex, i - startIndex + 1).Trim();
+                    return true;
+                }}
+            }}
+            error = "Error: Unterminated string result in response";
+            return false;
+        }}
+
+        int primitiveStart = i;
+        while (i < json.Length && json[i] != ',' && json[i] != '}}' && json[i] != ']')
+        {{
+            i++;
+        }}
+        resultValue = json.Substring(primitiveStart, i - primitiveStart).Trim();
+        return true;
     }}
 
     /// <summary>

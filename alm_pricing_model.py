@@ -136,24 +136,40 @@ class PricingModel(mlflow.pyfunc.PythonModel):
         )
 
 
+def _first_value(series: pd.Series):
+    value = series.iloc[0]
+    if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+        return value[0]
+    return value
+
+
+def _column_as_list(model_input: pd.DataFrame, column: str) -> list:
+    if column not in model_input.columns:
+        raise ValueError(f"Missing required column: {column}")
+    series = model_input[column]
+    if len(series) == 1 and isinstance(series.iloc[0], (list, tuple, np.ndarray, pd.Series)):
+        return list(series.iloc[0])
+    return series.tolist()
+
+
 class YieldCurveModel(mlflow.pyfunc.PythonModel):
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
-        curve_id = model_input["curve_id"].iloc[0]
-        curve_date = model_input["curve_date"].iloc[0]
+        curve_id = _first_value(model_input["curve_id"])
+        curve_date = _first_value(model_input["curve_date"])
         return get_asset_yield_curve(curve_id=curve_id, curve_date=curve_date)
 
 
 class CashflowsModel(mlflow.pyfunc.PythonModel):
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
-        policy_ids = model_input["policy_id"].tolist()
+        policy_ids = _column_as_list(model_input, "policy_id")
         return get_policy_cashflows(policy_ids=policy_ids)
 
 
 class DiscountModel(mlflow.pyfunc.PythonModel):
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
-        curve_id = model_input["curve_id"].iloc[0]
-        curve_date = model_input["curve_date"].iloc[0]
-        policy_ids = model_input["policy_id"].tolist()
+        curve_id = _first_value(model_input["curve_id"])
+        curve_date = _first_value(model_input["curve_date"])
+        policy_ids = _column_as_list(model_input, "policy_id")
 
         curve_input = pd.DataFrame({
             "curve_id": [curve_id],
