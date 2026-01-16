@@ -179,7 +179,7 @@ yield_curve_input_example = pd.DataFrame({
 yield_curve_output_example = get_asset_yield_curve("treasury_zero", "2024-12-31")
 
 cashflows_input_example = pd.DataFrame({"policy_id": ["POL001", "POL002"]})
-cashflows_output_example = get_policy_cashflows(["POL001", "POL002"])
+cashflows_output_example = get_policy_cashflows(["POL001", "POL002"]).astype("float64")
 
 discount_input_example = pd.DataFrame({
     "curve_id": ["treasury_zero", "treasury_zero"],

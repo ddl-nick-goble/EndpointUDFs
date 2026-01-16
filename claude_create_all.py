@@ -168,20 +168,25 @@ def infer_parameter_type(value: Any) -> str:
         return "object"
 
 
-def to_camel_case(name: str) -> str:
+def clean_function_name(name: str) -> str:
     """
-    Convert a model name to CamelCase, removing all punctuation.
+    Clean a model name for use as a function name.
+    Only applies CamelCase transformation if there's punctuation/spaces to remove.
 
     Examples:
         'hedging-model' -> 'HedgingModel'
         'my_cool_model' -> 'MyCoolModel'
-        'some.model.name' -> 'SomeModelName'
-        'already CamelCase' -> 'AlreadyCamelCase'
+        'HedgingModel' -> 'HedgingModel' (unchanged)
+        'SimpleModel' -> 'SimpleModel' (unchanged)
     """
-    # Split on any non-alphanumeric characters
+    # If the name is already clean (only alphanumeric), return as-is
+    if re.match(r'^[a-zA-Z][a-zA-Z0-9]*$', name):
+        return name
+
+    # Otherwise, split on non-alphanumeric and CamelCase it
     parts = re.split(r'[^a-zA-Z0-9]+', name)
-    # Capitalize each part and join
     camel = ''.join(part.capitalize() for part in parts if part)
+
     # Ensure it starts with a letter
     if camel and camel[0].isdigit():
         camel = 'Model' + camel
@@ -245,8 +250,8 @@ def discover_endpoints(project_id: str) -> list[EndpointConfig]:
             continue
 
         # Create the endpoint config
-        # Use the endpoint name (model name in Domino), converted to CamelCase
-        function_name = to_camel_case(name)
+        # Use the endpoint name, cleaned up only if it has punctuation
+        function_name = clean_function_name(name)
         endpoint = EndpointConfig(
             name=function_name,
             url=curl_info['url'],
