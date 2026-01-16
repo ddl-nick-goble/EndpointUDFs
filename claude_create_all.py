@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""
+Combined Excel-DNA Add-in Generator for Domino Model Endpoints
+
+This script:
+1. Fetches all models for a given Domino project
+2. Extracts curl commands and credentials from the model overview pages
+3. Retrieves parameter signatures from MLflow (if available)
+4. Generates a complete Excel-DNA add-in (.xll) with User Defined Functions (UDFs)
+
+Each discovered endpoint is converted into a strongly-typed UDF with full documentation,
+parameter descriptions, and error handling.
+"""
+
+import base64
+import html
+import json
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from dataclasses import dataclass
+from typing import Any
+
+import requests
+
+# Environment configuration
+DOMINO_URL = os.environ.get("DOMINO_URL", "https://se-demo.domino.tech:443")
+API_KEY = os.environ.get("DOMINO_USER_API_KEY", "")
+PROJECT_ID = os.environ.get("DOMINO_PROJECT_ID", "")
+
+
+@dataclass
+class EndpointConfig:
+    """Configuration for a single API endpoint to be converted to a UDF."""
+    name: str
+    url: str
+    username: str
+    password: str
+    parameters: list[dict[str, Any]]  # List of {name, type, description, example}
+    description: str
+    return_description: str
+
+
+# =============================================================================
+# Endpoint Discovery Functions (from claude_create_curls.py)
+# =============================================================================
+
+def get_models(project_id: str) -> list:
+    """Get all models for a project."""
+    url = f"{DOMINO_URL}/v4/modelManager/getModels"
+    headers = {"X-Domino-Api-Key": API_KEY}
+    resp = requests.get(url, params={"projectId": project_id}, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def get_model_signature(model_name: str, model_version: int) -> dict | None:
+    """Get the signature for a registered model version from MLflow."""
+    tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "")
+    if not tracking_uri:
+        return None
+
+    # Get the model version info to find the artifact source
+    url = f"{tracking_uri.rstrip('/')}/api/2.0/mlflow/model-versions/get"
+    resp = requests.get(url, params={"name": model_name, "version": model_version}, timeout=15)
+    if resp.status_code != 200:
+        return None
+
+    source = resp.json().get("model_version", {}).get("source")
+    if not source:
+        return None
+
+    # Download and parse the input example
+    try:
+        from mlflow import artifacts
+        os.environ.setdefault("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
+        local_dir = artifacts.download_artifacts(artifact_uri=source)
+
+        for fname in ("serving_input_example.json", "input_example.json"):
+            path = os.path.join(local_dir, fname)
+            if os.path.exists(path):
+                with open(path) as f:
+                    example = json.load(f)
+                # Convert dataframe_split format to simple dict
+                if "dataframe_split" in example:
+                    cols = example["dataframe_split"]["columns"]
+                    row = example["dataframe_split"]["data"][0]
+                    return {"data": {col: row[i] for i, col in enumerate(cols)}}
+                if "data" in example:
+                    return example
+    except Exception:
+        pass
+
+    return None
+
+
+def get_curl_from_html(model_id: str) -> str | None:
+    """Fetch the model overview page and extract the curl command."""
+    url = f"{DOMINO_URL}/models/{model_id}/overview"
+    headers = {"X-Domino-Api-Key": API_KEY}
+    resp = requests.get(url, headers=headers, timeout=15)
+    if resp.status_code != 200:
+        return None
+
+    # Extract curl from the HTML
+    match = re.search(
+        r'<div role="tabpanel" class="tab-pane" id="language-curl">.*?<pre[^>]*>(.*?)</pre>',
+        resp.text,
+        flags=re.S | re.I,
+    )
+    if not match:
+        return None
+
+    return html.unescape(match.group(1)).strip()
+
+
+def parse_curl_command(curl_text: str) -> dict | None:
+    """
+    Parse a curl command to extract URL, credentials, and payload.
+
+    Returns dict with keys: url, username, password, data
+    """
+    if not curl_text:
+        return None
+
+    result = {}
+
+    # Extract URL - look for the URL in the curl command
+    # Usually follows 'curl' and comes before or after flags
+    url_match = re.search(r'https?://[^\s\'"]+', curl_text)
+    if url_match:
+        result['url'] = url_match.group(0)
+
+    # Extract basic auth credentials (-u or --user flag)
+    # Format: -u username:password or --user username:password
+    auth_match = re.search(r'(?:-u|--user)\s+[\'"]?([^:]+):([^\s\'"]+)[\'"]?', curl_text)
+    if auth_match:
+        result['username'] = auth_match.group(1)
+        result['password'] = auth_match.group(2)
+
+    # Extract the data payload (-d flag)
+    # Could be -d 'JSON' or -d "JSON"
+    data_match = re.search(r"-d\s+'([^']*)'", curl_text)
+    if not data_match:
+        data_match = re.search(r'-d\s+"([^"]*)"', curl_text)
+    if data_match:
+        try:
+            result['data'] = json.loads(data_match.group(1))
+        except json.JSONDecodeError:
+            result['data'] = None
+
+    return result if 'url' in result else None
+
+
+def infer_parameter_type(value: Any) -> str:
+    """Infer the C# type from a Python value."""
+    if isinstance(value, bool):
+        return "bool"
+    elif isinstance(value, int):
+        return "double"  # Use double for all numbers in Excel
+    elif isinstance(value, float):
+        return "double"
+    elif isinstance(value, str):
+        return "string"
+    else:
+        return "object"
+
+
+def to_camel_case(name: str) -> str:
+    """
+    Convert a model name to CamelCase, removing all punctuation.
+
+    Examples:
+        'hedging-model' -> 'HedgingModel'
+        'my_cool_model' -> 'MyCoolModel'
+        'some.model.name' -> 'SomeModelName'
+        'already CamelCase' -> 'AlreadyCamelCase'
+    """
+    # Split on any non-alphanumeric characters
+    parts = re.split(r'[^a-zA-Z0-9]+', name)
+    # Capitalize each part and join
+    camel = ''.join(part.capitalize() for part in parts if part)
+    # Ensure it starts with a letter
+    if camel and camel[0].isdigit():
+        camel = 'Model' + camel
+    return camel or 'UnnamedModel'
+
+
+def discover_endpoints(project_id: str) -> list[EndpointConfig]:
+    """
+    Discover all model endpoints in a project and build EndpointConfig objects.
+    """
+    endpoints = []
+    models = get_models(project_id)
+
+    for model in models:
+        model_id = model.get("id")
+        name = model.get("name", "UnnamedModel")
+        active = model.get("activeVersion") or {}
+        registered_name = active.get("registeredModelName")
+        registered_version = active.get("registeredModelVersion")
+
+        if not model_id:
+            continue
+
+        print(f"  Discovering: {name}...")
+
+        # Get the curl from the overview page
+        curl_text = get_curl_from_html(model_id)
+        if not curl_text:
+            print(f"    (skipped - no curl found)")
+            continue
+
+        # Parse the curl command
+        curl_info = parse_curl_command(curl_text)
+        if not curl_info or 'username' not in curl_info or 'password' not in curl_info:
+            print(f"    (skipped - could not parse curl)")
+            continue
+
+        # Try to get the signature from MLflow
+        signature = None
+        if registered_name and registered_version:
+            signature = get_model_signature(registered_name, registered_version)
+
+        # If no MLflow signature, try to use the data from the curl command
+        if not signature and curl_info.get('data'):
+            signature = curl_info['data']
+
+        # Build parameters from the signature
+        parameters = []
+        if signature and 'data' in signature and isinstance(signature['data'], dict):
+            for param_name, param_value in signature['data'].items():
+                param_type = infer_parameter_type(param_value)
+                parameters.append({
+                    "name": param_name,
+                    "type": param_type,
+                    "description": f"The {param_name} parameter for the model",
+                    "example": param_value
+                })
+
+        if not parameters:
+            print(f"    (skipped - no parameters found in signature)")
+            continue
+
+        # Create the endpoint config
+        # Use the endpoint name (model name in Domino), converted to CamelCase
+        function_name = to_camel_case(name)
+        endpoint = EndpointConfig(
+            name=function_name,
+            url=curl_info['url'],
+            username=curl_info['username'],
+            password=curl_info['password'],
+            parameters=parameters,
+            description=f"Calls the {name} Domino model API endpoint.",
+            return_description="Returns the model result value (spills across cells if array)"
+        )
+        endpoints.append(endpoint)
+        param_names = ", ".join([p["name"] for p in parameters])
+        print(f"    Found: Domino.{function_name}({param_names})")
+
+    return endpoints
+
+
+# =============================================================================
+# Code Generation Functions (from claude_create_udfs.py)
+# =============================================================================
+
+def generate_udf_method(endpoint: EndpointConfig) -> str:
+    """Generate a C# UDF method for a single endpoint."""
+
+    # Build ExcelArgument attributes and parameter section
+    param_section_parts = []
+    for p in endpoint.parameters:
+        excel_arg = f'[ExcelArgument(Name = "{p["name"]}", Description = "{p["description"]}")]'
+        param_section_parts.append(f'{excel_arg} {p["type"]} {p["name"]}')
+
+    param_section = ", ".join(param_section_parts)
+
+    # Build JSON payload construction based on parameter types
+    json_parts = []
+    for p in endpoint.parameters:
+        param_name = p["name"]
+        if p["type"] == "string":
+            # String parameters need quotes in JSON
+            # In C#: "\"key\": \"" + value.Replace(...) + "\""
+            json_parts.append(
+                f'\\"{param_name}\\": \\"" + {param_name}.Replace("\\\\", "\\\\\\\\").Replace("\\"", "\\\\\\"") + "\\""'
+            )
+        elif p["type"] == "bool":
+            # Boolean parameters need lowercase true/false
+            json_parts.append(
+                f'\\"{param_name}\\": " + ({param_name} ? "true" : "false") + "'
+            )
+        else:
+            # Numeric parameters
+            json_parts.append(
+                f'\\"{param_name}\\": " + {param_name}.ToString(System.Globalization.CultureInfo.InvariantCulture) + "'
+            )
+
+    # Join with commas - the format is: "{\"data\": {\"key1\": " + val1 + ", \"key2\": " + val2 + "}}"
+    json_inner = ", ".join(json_parts)
+    json_construction = f'"{{\\\"data\\\": {{{json_inner}}}}}"'
+
+    # Base64 encode credentials
+    credentials = f'{endpoint.username}:{endpoint.password}'
+    auth_header = base64.b64encode(credentials.encode()).decode()
+
+    # Escape description for C# string
+    escaped_description = endpoint.description.replace('"', '\\"')
+
+    # Excel function name with Domino. prefix
+    excel_function_name = f"Domino.{endpoint.name}"
+
+    method = f'''
+        /// <summary>
+        /// {endpoint.description}
+        /// </summary>
+        /// <returns>{endpoint.return_description}</returns>
+        [ExcelFunction(
+            Name = "{excel_function_name}",
+            Description = "{escaped_description}",
+            Category = "Domino Model APIs",
+            IsVolatile = false,
+            IsExceptionSafe = true
+        )]
+        public static object {endpoint.name}(
+            {param_section})
+        {{
+            try
+            {{
+                // Force TLS 1.2 (required for modern HTTPS endpoints)
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+
+                string url = "{endpoint.url}";
+                string jsonPayload = {json_construction};
+
+                using (var client = new WebClient())
+                {{
+                    client.Headers[HttpRequestHeader.ContentType] = "application/json";
+                    client.Headers[HttpRequestHeader.Authorization] = "Basic {auth_header}";
+
+                    string response = client.UploadString(url, "POST", jsonPayload);
+                    return ParseResult(response);
+                }}
+            }}
+            catch (WebException ex)
+            {{
+                if (ex.Response != null)
+                {{
+                    using (var reader = new StreamReader(ex.Response.GetResponseStream()))
+                    {{
+                        return "API Error: " + reader.ReadToEnd();
+                    }}
+                }}
+                return "Error: " + ex.Message;
+            }}
+            catch (Exception ex)
+            {{
+                return "Error: " + ex.Message;
+            }}
+        }}
+'''
+    return method
+
+
+def generate_csharp_code(endpoints: list[EndpointConfig]) -> str:
+    """Generate the complete C# add-in code."""
+
+    methods = "\n".join([generate_udf_method(ep) for ep in endpoints])
+
+    # Build function documentation
+    func_docs = "\n".join([f"/// - Domino.{ep.name}: {ep.description[:60]}..." for ep in endpoints])
+
+    code = f'''using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
+using System.Text.RegularExpressions;
+using ExcelDna.Integration;
+
+/// <summary>
+/// Excel-DNA Add-in providing UDFs for Domino Model API endpoints.
+///
+/// This add-in was auto-generated and provides the following functions:
+{func_docs}
+///
+/// Each function calls a specific Domino model endpoint with the provided parameters
+/// and returns the result from the model (supports array spilling for multiple results).
+/// </summary>
+public static class DominoModelFunctions
+{{
+    /// <summary>
+    /// Extracts the "result" field from the JSON response and returns it as Excel-friendly output.
+    /// Handles single values, 1D arrays (horizontal spill), and 2D arrays (grid spill).
+    /// </summary>
+    private static object ParseResult(string json)
+    {{
+        // Find the "result" field using regex (lightweight, no external JSON dependency)
+        var resultMatch = Regex.Match(json, @"""result""\s*:\s*(\[[\s\S]*?\]|[^,\}}]+)");
+        if (!resultMatch.Success)
+        {{
+            return "Error: No result field in response";
+        }}
+
+        string resultValue = resultMatch.Groups[1].Value.Trim();
+
+        // Check if it's a 2D array (array of arrays) like [[1,2],[3,4]]
+        if (resultValue.StartsWith("[["))
+        {{
+            return Parse2DArray(resultValue);
+        }}
+        // Check if it's a 1D array like [1,2,3]
+        else if (resultValue.StartsWith("[") && resultValue.EndsWith("]"))
+        {{
+            return Parse1DArray(resultValue);
+        }}
+        else
+        {{
+            // Single value
+            return ParseSingleValue(resultValue);
+        }}
+    }}
+
+    /// <summary>
+    /// Parses a 2D array like [[1,2,3],[4,5,6]] into an Excel-compatible object[,] for grid spill.
+    /// </summary>
+    private static object Parse2DArray(string arrayStr)
+    {{
+        // Extract inner arrays using regex to find each [...] row
+        var rowMatches = Regex.Matches(arrayStr, @"\[([^\[\]]*)\]");
+        if (rowMatches.Count == 0)
+        {{
+            return "Error: Invalid 2D array format";
+        }}
+
+        // Parse each row to get dimensions and values
+        var rows = new List<List<object>>();
+        int maxCols = 0;
+
+        foreach (Match rowMatch in rowMatches)
+        {{
+            string rowContent = rowMatch.Groups[1].Value;
+            var rowValues = new List<object>();
+
+            if (!string.IsNullOrWhiteSpace(rowContent))
+            {{
+                var parts = rowContent.Split(new[] {{ ',' }}, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var part in parts)
+                {{
+                    rowValues.Add(ParseSingleValue(part.Trim()));
+                }}
+            }}
+
+            rows.Add(rowValues);
+            if (rowValues.Count > maxCols)
+            {{
+                maxCols = rowValues.Count;
+            }}
+        }}
+
+        // Handle edge cases
+        if (rows.Count == 0 || maxCols == 0)
+        {{
+            return "";
+        }}
+        if (rows.Count == 1 && rows[0].Count == 1)
+        {{
+            return rows[0][0];
+        }}
+
+        // Create 2D array for Excel grid spill
+        object[,] spillArray = new object[rows.Count, maxCols];
+        for (int r = 0; r < rows.Count; r++)
+        {{
+            for (int c = 0; c < maxCols; c++)
+            {{
+                if (c < rows[r].Count)
+                {{
+                    spillArray[r, c] = rows[r][c];
+                }}
+                else
+                {{
+                    spillArray[r, c] = ""; // Pad jagged arrays
+                }}
+            }}
+        }}
+        return spillArray;
+    }}
+
+    /// <summary>
+    /// Parses a 1D array like [1,2,3] into an Excel-compatible object[,] for horizontal spill.
+    /// </summary>
+    private static object Parse1DArray(string arrayStr)
+    {{
+        string inner = arrayStr.Substring(1, arrayStr.Length - 2).Trim();
+        if (string.IsNullOrEmpty(inner))
+        {{
+            return "";
+        }}
+
+        var parts = inner.Split(new[] {{ ',' }}, StringSplitOptions.RemoveEmptyEntries);
+        var results = new List<object>();
+
+        foreach (var part in parts)
+        {{
+            results.Add(ParseSingleValue(part.Trim()));
+        }}
+
+        if (results.Count == 1)
+        {{
+            return results[0];
+        }}
+
+        // Create a 1-row, N-column array for horizontal spill
+        object[,] spillArray = new object[1, results.Count];
+        for (int i = 0; i < results.Count; i++)
+        {{
+            spillArray[0, i] = results[i];
+        }}
+        return spillArray;
+    }}
+
+    /// <summary>
+    /// Parses a single value (number or string) into the appropriate type.
+    /// </summary>
+    private static object ParseSingleValue(string value)
+    {{
+        string trimmed = value.Trim();
+        if (double.TryParse(trimmed, System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture, out double numVal))
+        {{
+            return numVal;
+        }}
+        return trimmed.Trim('"');
+    }}
+
+{methods}
+}}
+'''
+    return code
+
+
+def generate_dna_file() -> str:
+    """Generate the Excel-DNA .dna configuration file."""
+    return '''<?xml version="1.0" encoding="utf-8"?>
+<DnaLibrary Name="Domino Model APIs Add-In" RuntimeVersion="v4.0">
+  <ExternalLibrary Path="DominoModelFunctions.dll" ExplicitExports="false" LoadFromBytes="true" Pack="true" />
+</DnaLibrary>
+'''
+
+
+def build_addin(endpoints: list[EndpointConfig]) -> str | None:
+    """Build the Excel-DNA add-in."""
+
+    if not endpoints:
+        print("No endpoints to build. Exiting.")
+        return None
+
+    print()
+    print("=" * 60)
+    print("Building Excel Add-in")
+    print("=" * 60)
+    print()
+
+    # Create a temporary build directory
+    build_dir = tempfile.mkdtemp(prefix="exceldna_build_")
+    print(f"[1/6] Created temporary build directory: {build_dir}")
+
+    try:
+        # Write the C# code
+        cs_file = os.path.join(build_dir, "DominoModelFunctions.cs")
+        with open(cs_file, "w") as f:
+            f.write(generate_csharp_code(endpoints))
+        print(f"[2/6] Generated C# source code with {len(endpoints)} UDF(s):")
+        for ep in endpoints:
+            params = ", ".join([p["name"] for p in ep.parameters])
+            print(f"       - Domino.{ep.name}({params})")
+
+        # Write the .dna file
+        dna_file = os.path.join(build_dir, "DominoModelFunctions.dna")
+        with open(dna_file, "w") as f:
+            f.write(generate_dna_file())
+        print("[3/6] Generated Excel-DNA configuration file")
+
+        # Create a .csproj file for building
+        csproj_content = '''<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <OutputType>Library</OutputType>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="ExcelDna.AddIn" Version="1.7.0" />
+  </ItemGroup>
+</Project>
+'''
+        csproj_file = os.path.join(build_dir, "DominoModelFunctions.csproj")
+        with open(csproj_file, "w") as f:
+            f.write(csproj_content)
+        print("[4/6] Generated project file")
+
+        # Run dotnet restore and build
+        print("[5/6] Building add-in (this may take a moment)...")
+
+        # Restore packages
+        result = subprocess.run(
+            ["dotnet", "restore"],
+            cwd=build_dir,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            print(f"       Restore output: {result.stdout}")
+            print(f"       Restore errors: {result.stderr}")
+            raise RuntimeError(f"dotnet restore failed: {result.stderr}")
+
+        # Build the project
+        result = subprocess.run(
+            ["dotnet", "build", "-c", "Release"],
+            cwd=build_dir,
+            capture_output=True,
+            text=True
+        )
+        if result.returncode != 0:
+            print(f"       Build output: {result.stdout}")
+            print(f"       Build errors: {result.stderr}")
+            raise RuntimeError(f"dotnet build failed: {result.stderr}")
+
+        print("       Build completed successfully!")
+
+        # Find the PACKED .xll files
+        publish_dir = os.path.join(build_dir, "bin", "Release", "net48", "publish")
+
+        src_xll_64 = None
+        src_xll_32 = None
+
+        if os.path.exists(publish_dir):
+            for f in os.listdir(publish_dir):
+                if f.endswith("-packed.xll"):
+                    full_path = os.path.join(publish_dir, f)
+                    if "64" in f:
+                        src_xll_64 = full_path
+                    else:
+                        src_xll_32 = full_path
+
+        if not src_xll_64 and not src_xll_32:
+            # Fallback: search entire build directory for packed xll files
+            for root, dirs, files in os.walk(build_dir):
+                for f in files:
+                    if f.endswith("-packed.xll"):
+                        full_path = os.path.join(root, f)
+                        if "64" in f:
+                            src_xll_64 = full_path
+                        else:
+                            src_xll_32 = full_path
+
+        if not src_xll_64 and not src_xll_32:
+            raise RuntimeError("Could not find packed .xll files. Check build output.")
+
+        # Copy to current directory
+        copied_files = []
+        if src_xll_64:
+            dest_xll_64 = os.path.join(os.getcwd(), "DominoModelFunctions-AddIn64.xll")
+            shutil.copy(src_xll_64, dest_xll_64)
+            copied_files.append(("64-bit", dest_xll_64))
+
+        if src_xll_32:
+            dest_xll_32 = os.path.join(os.getcwd(), "DominoModelFunctions-AddIn.xll")
+            shutil.copy(src_xll_32, dest_xll_32)
+            copied_files.append(("32-bit", dest_xll_32))
+
+        print(f"[6/6] Add-in created successfully!")
+        for arch, path in copied_files:
+            print(f"       {arch}: {path}")
+
+        print()
+        print("=" * 60)
+        print("SUCCESS! Your Excel add-in is ready.")
+        print("=" * 60)
+        print()
+        print("To use the add-in:")
+        print("  1. Open Excel")
+        print("  2. Go to File > Options > Add-ins")
+        print("  3. At the bottom, select 'Excel Add-ins' and click 'Go...'")
+        print("  4. Click 'Browse...' and select the .xll file")
+        print("  5. Click OK to enable the add-in")
+        print()
+        print("Available functions:")
+        for ep in endpoints:
+            params = ", ".join([p["name"] for p in ep.parameters])
+            print(f"  =Domino.{ep.name}({params})")
+            print(f"    {ep.description[:70]}...")
+            print()
+
+        return copied_files[0][1] if copied_files else None
+
+    finally:
+        # Clean up the temp directory
+        shutil.rmtree(build_dir, ignore_errors=True)
+
+
+def main():
+    """Main entry point - discover endpoints and build add-in."""
+
+    print("=" * 60)
+    print("Domino Model APIs - Combined Endpoint Discovery & Add-in Generator")
+    print("=" * 60)
+    print()
+
+    # Check required environment variables
+    if not API_KEY:
+        print("Error: DOMINO_USER_API_KEY environment variable is required")
+        return
+
+    project_id = PROJECT_ID
+    if not project_id:
+        print("Error: DOMINO_PROJECT_ID environment variable is required")
+        return
+
+    print(f"Domino URL: {DOMINO_URL}")
+    print(f"Project ID: {project_id}")
+    print()
+
+    # Step 1: Discover endpoints
+    print("Step 1: Discovering model endpoints...")
+    print("-" * 40)
+    endpoints = discover_endpoints(project_id)
+
+    if not endpoints:
+        print()
+        print("No valid endpoints discovered. Check that:")
+        print("  - The project has deployed models with active versions")
+        print("  - The models have input signatures (from MLflow or curl data)")
+        print("  - Your API key has access to view the models")
+        return
+
+    print()
+    print(f"Discovered {len(endpoints)} endpoint(s)")
+    print()
+
+    # Step 2: Build the add-in
+    print("Step 2: Building Excel add-in...")
+    print("-" * 40)
+
+    try:
+        build_addin(endpoints)
+    except Exception as e:
+        print(f"\nBuild Error: {e}")
+        print("\nTroubleshooting:")
+        print("  - Ensure .NET SDK (6.0+) is installed: dotnet --version")
+        print("  - On Linux/Mac, you may need to build on Windows for .xll generation")
+        print()
+
+        # Output the C# code so user can build manually if needed
+        print("=" * 60)
+        print("FALLBACK: Generated C# Code (copy to build manually)")
+        print("=" * 60)
+        print(generate_csharp_code(endpoints))
+        print()
+        print("=" * 60)
+        print("FALLBACK: .dna Configuration File")
+        print("=" * 60)
+        print(generate_dna_file())
+
+
+if __name__ == "__main__":
+    main()

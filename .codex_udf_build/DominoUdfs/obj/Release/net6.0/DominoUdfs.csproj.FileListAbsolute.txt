@@ -1,0 +1,13 @@
+/mnt/code/.codex_udf_build/DominoUdfs/bin/Release/net6.0/DominoUdfs.deps.json
+/mnt/code/.codex_udf_build/DominoUdfs/bin/Release/net6.0/DominoUdfs.dll
+/mnt/code/.codex_udf_build/DominoUdfs/bin/Release/net6.0/DominoUdfs.pdb
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/DominoUdfs.csproj.AssemblyReference.cache
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/DominoUdfs.GeneratedMSBuildEditorConfig.editorconfig
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/DominoUdfs.AssemblyInfoInputs.cache
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/DominoUdfs.AssemblyInfo.cs
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/DominoUdfs.csproj.CoreCompileInputs.cache
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/DominoUdfs.sourcelink.json
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/DominoUdfs.dll
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/refint/DominoUdfs.dll
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/DominoUdfs.pdb
+/mnt/code/.codex_udf_build/DominoUdfs/obj/Release/net6.0/ref/DominoUdfs.dll

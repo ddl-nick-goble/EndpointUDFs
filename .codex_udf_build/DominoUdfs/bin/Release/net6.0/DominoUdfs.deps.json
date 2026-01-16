@@ -1,0 +1,41 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v6.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v6.0": {
+      "DominoUdfs/1.0.0": {
+        "dependencies": {
+          "ExcelDna.Integration": "1.7.0"
+        },
+        "runtime": {
+          "DominoUdfs.dll": {}
+        }
+      },
+      "ExcelDna.Integration/1.7.0": {
+        "runtime": {
+          "lib/net452/ExcelDna.Integration.dll": {
+            "assemblyVersion": "1.1.0.0",
+            "fileVersion": "1.7.0.11"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "DominoUdfs/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "ExcelDna.Integration/1.7.0": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-foruOl8aMslv4396rRDZDSNAvJMQe0ftjwJ/Ubvc4vZNPChsenFNeM5JrTk3og/BNNckgLJ1FwEkk7Np2X2veg==",
+      "path": "exceldna.integration/1.7.0",
+      "hashPath": "exceldna.integration.1.7.0.nupkg.sha512"
+    }
+  }
+}

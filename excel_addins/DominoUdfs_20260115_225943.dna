@@ -1,0 +1,3 @@
+<DnaLibrary Name="DominoUdfs_20260115_225943" RuntimeVersion="v4.0">
+  <ExternalLibrary Path="DominoUdfs.dll" />
+</DnaLibrary>
