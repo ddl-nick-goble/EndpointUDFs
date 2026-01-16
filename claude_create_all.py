@@ -56,8 +56,71 @@ def get_models(project_id: str) -> list:
     return resp.json()
 
 
+def _load_input_example(local_dir: str) -> dict | None:
+    """Load the input example from MLflow artifacts, if present."""
+    for fname in ("serving_input_example.json", "input_example.json"):
+        path = os.path.join(local_dir, fname)
+        if os.path.exists(path):
+            with open(path) as f:
+                example = json.load(f)
+            # Convert dataframe_split format to simple dict
+            if "dataframe_split" in example:
+                cols = example["dataframe_split"]["columns"]
+                data_rows = example["dataframe_split"]["data"]
+                if not data_rows:
+                    return {"data": {col: None for col in cols}}
+                if len(data_rows) == 1:
+                    row = data_rows[0]
+                    return {"data": {col: row[i] for i, col in enumerate(cols)}}
+                col_data = {col: [] for col in cols}
+                for row in data_rows:
+                    for i, col in enumerate(cols):
+                        col_data[col].append(row[i])
+                return {"data": col_data}
+            if "data" in example:
+                return example
+    return None
+
+
+def _load_signature_inputs(local_dir: str) -> list[dict[str, Any]] | None:
+    """Load the MLflow model signature inputs from the MLmodel file."""
+    mlmodel_path = os.path.join(local_dir, "MLmodel")
+    if not os.path.exists(mlmodel_path):
+        return None
+
+    try:
+        import yaml
+    except Exception:
+        return None
+
+    with open(mlmodel_path) as f:
+        mlmodel = yaml.safe_load(f)
+
+    signature = mlmodel.get("signature") if isinstance(mlmodel, dict) else None
+    if not signature:
+        return None
+
+    inputs = signature.get("inputs")
+    if not inputs:
+        return None
+
+    if isinstance(inputs, str):
+        try:
+            inputs = json.loads(inputs)
+        except json.JSONDecodeError:
+            return None
+
+    if isinstance(inputs, dict) and "inputs" in inputs:
+        inputs = inputs["inputs"]
+
+    if not isinstance(inputs, list):
+        return None
+
+    return inputs
+
+
 def get_model_signature(model_name: str, model_version: int) -> dict | None:
-    """Get the signature for a registered model version from MLflow."""
+    """Get the signature and input example for a registered model version from MLflow."""
     tracking_uri = os.environ.get("MLFLOW_TRACKING_URI", "")
     if not tracking_uri:
         return None
@@ -72,24 +135,16 @@ def get_model_signature(model_name: str, model_version: int) -> dict | None:
     if not source:
         return None
 
-    # Download and parse the input example
+    # Download the model artifacts and parse signature + input example
     try:
         from mlflow import artifacts
         os.environ.setdefault("MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR", "false")
         local_dir = artifacts.download_artifacts(artifact_uri=source)
 
-        for fname in ("serving_input_example.json", "input_example.json"):
-            path = os.path.join(local_dir, fname)
-            if os.path.exists(path):
-                with open(path) as f:
-                    example = json.load(f)
-                # Convert dataframe_split format to simple dict
-                if "dataframe_split" in example:
-                    cols = example["dataframe_split"]["columns"]
-                    row = example["dataframe_split"]["data"][0]
-                    return {"data": {col: row[i] for i, col in enumerate(cols)}}
-                if "data" in example:
-                    return example
+        signature_inputs = _load_signature_inputs(local_dir)
+        example = _load_input_example(local_dir)
+        if signature_inputs or example:
+            return {"signature_inputs": signature_inputs, "example": example}
     except Exception:
         pass
 
@@ -152,6 +207,69 @@ def parse_curl_command(curl_text: str) -> dict | None:
             result['data'] = None
 
     return result if 'url' in result else None
+
+
+def _split_param_tokens(name: str) -> list[str]:
+    """Split a parameter name into lowercase tokens for heuristics."""
+    if not name:
+        return []
+    tokens = re.findall(r"[A-Z]?[a-z]+|[0-9]+|[A-Z]+(?![a-z])", name)
+    if not tokens:
+        tokens = re.split(r"[^a-zA-Z0-9]+", name)
+    return [t.lower() for t in tokens if t]
+
+
+def _looks_like_date_string(value: str) -> bool:
+    """Detect common date formats like yyyy-mm-dd or ISO timestamps."""
+    if not value:
+        return False
+    return bool(re.match(r"^\d{4}[-/]\d{2}[-/]\d{2}([ T].*)?$", value.strip()))
+
+
+def _is_date_param(name: str, value: Any) -> bool:
+    """Heuristic detection for date-like parameters."""
+    tokens = _split_param_tokens(name)
+    if any(t in {"date", "dt", "dob"} for t in tokens):
+        return True
+    if isinstance(value, str) and _looks_like_date_string(value):
+        return True
+    return False
+
+
+def _map_mlflow_type(type_name: str, name: str, example: Any) -> str:
+    """Map MLflow type name to a UDF parameter type."""
+    if not type_name:
+        return "string" if _is_date_param(name, example) else infer_parameter_type(example)
+
+    lower = type_name.lower()
+    if lower in {"boolean", "bool"}:
+        return "bool"
+    if lower in {"integer", "long", "int", "short"}:
+        return "double"
+    if lower in {"double", "float", "float32", "float64"}:
+        return "double"
+    if lower in {"date", "datetime"}:
+        return "date"
+    if lower in {"string", "str"}:
+        return "date" if _is_date_param(name, example) else "string"
+    return "object"
+
+
+def _parse_mlflow_input_type(spec: dict[str, Any]) -> tuple[str, bool]:
+    """Parse MLflow input spec to get base type and array flag."""
+    type_name = str(spec.get("type", "") or "")
+
+    if type_name.lower() == "tensor":
+        tensor_spec = spec.get("tensor-spec", {}) or {}
+        dtype = str(tensor_spec.get("dtype", "") or "")
+        return _map_mlflow_type(dtype, spec.get("name", ""), None), True
+
+    array_match = re.match(r"array<([^>]+)>", type_name, flags=re.I)
+    if array_match:
+        base_type = array_match.group(1)
+        return _map_mlflow_type(base_type, spec.get("name", ""), None), True
+
+    return _map_mlflow_type(type_name, spec.get("name", ""), None), False
 
 
 def infer_parameter_type(value: Any) -> str:
@@ -229,18 +347,51 @@ def discover_endpoints(project_id: str) -> list[EndpointConfig]:
         if registered_name and registered_version:
             signature = get_model_signature(registered_name, registered_version)
 
-        # If no MLflow signature, try to use the data from the curl command
-        if not signature and curl_info.get('data'):
-            signature = curl_info['data']
+        signature_inputs = None
+        example_data = None
+        if signature:
+            signature_inputs = signature.get("signature_inputs")
+            example = signature.get("example")
+            if example and isinstance(example, dict):
+                example_data = example.get("data")
 
-        # Build parameters from the signature
+        # If no MLflow signature, try to use the data from the curl command
+        if not signature_inputs and curl_info.get('data'):
+            signature_inputs = None
+            example_data = curl_info.get("data", {}).get("data")
+
+        # Build parameters from the MLflow signature (preferred)
         parameters = []
-        if signature and 'data' in signature and isinstance(signature['data'], dict):
-            for param_name, param_value in signature['data'].items():
-                param_type = infer_parameter_type(param_value)
+        if signature_inputs:
+            for spec in signature_inputs:
+                param_name = spec.get("name")
+                if not param_name:
+                    continue
+                example_value = None
+                if example_data and param_name in example_data:
+                    example_value = example_data[param_name]
+                param_type, is_array = _parse_mlflow_input_type(spec)
+                if _is_date_param(param_name, example_value) and param_type == "string":
+                    param_type = "date"
                 parameters.append({
                     "name": param_name,
                     "type": param_type,
+                    "is_array": is_array,
+                    "description": f"The {param_name} parameter for the model",
+                    "example": example_value
+                })
+
+        # Fallback: derive parameters from example data if signature is missing
+        if not parameters and isinstance(example_data, dict):
+            for param_name, param_value in example_data.items():
+                param_type = infer_parameter_type(param_value)
+                is_array = isinstance(param_value, (list, tuple))
+                if _is_date_param(param_name, param_value) and param_type == "string":
+                    param_type = "date"
+                parameters.append({
+                    "name": param_name,
+                    "type": param_type,
+                    "is_array": is_array,
                     "description": f"The {param_name} parameter for the model",
                     "example": param_value
                 })
@@ -279,7 +430,10 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
     param_section_parts = []
     for p in endpoint.parameters:
         excel_arg = f'[ExcelArgument(Name = "{p["name"]}", Description = "{p["description"]}")]'
-        param_section_parts.append(f'{excel_arg} {p["type"]} {p["name"]}')
+        param_type = p["type"]
+        if p.get("is_array") or param_type == "date":
+            param_type = "object"
+        param_section_parts.append(f'{excel_arg} {param_type} {p["name"]}')
 
     param_section = ", ".join(param_section_parts)
 
@@ -292,18 +446,21 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
         param_name = p["name"]
         is_last = (i == len(endpoint.parameters) - 1)
         separator = "" if is_last else ", "
-
-        if p["type"] == "string":
-            # String parameters: "key": "value" with escaping
-            # C# output: "\"key\": \"" + val.Replace("\\", "\\\\").Replace("\"", "\\\"") + "\""
-            escaped_value = f'{param_name}.Replace("\\\\", "\\\\\\\\").Replace("\\"", "\\\\\\"")'
-            json_parts.append(f'"\\\"{param_name}\\\": \\"" + {escaped_value} + "\\"{separator}"')
-        elif p["type"] == "bool":
-            # Boolean parameters: "key": true/false
-            json_parts.append(f'"\\\"{param_name}\\\": " + ({param_name} ? "true" : "false") + "{separator}"')
-        else:
-            # Numeric parameters: "key": 123.45
-            json_parts.append(f'"\\\"{param_name}\\\": " + {param_name}.ToString(System.Globalization.CultureInfo.InvariantCulture) + "{separator}"')
+        param_kind = p["type"]
+        if param_kind == "object":
+            param_kind = "string"
+        if param_kind not in {"string", "bool", "date"}:
+            param_kind = "number"
+        kind_enum = {
+            "string": "ParamKind.String",
+            "bool": "ParamKind.Bool",
+            "date": "ParamKind.Date",
+            "number": "ParamKind.Number",
+        }[param_kind]
+        allow_array = "true" if p.get("is_array") else "false"
+        json_parts.append(
+            f'"\\\"{param_name}\\\": " + SerializeParamValue({param_name}, {kind_enum}, {allow_array}) + "{separator}"'
+        )
 
     # Join the parts with + operator
     json_inner = " + ".join(json_parts)
@@ -381,8 +538,10 @@ def generate_csharp_code(endpoints: list[EndpointConfig]) -> str:
 
     code = f'''using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Text;
 using System.Text.RegularExpressions;
 using ExcelDna.Integration;
 
@@ -397,20 +556,240 @@ using ExcelDna.Integration;
 /// </summary>
 public static class DominoModelFunctions
 {{
+    private enum ParamKind
+    {{
+        String,
+        Number,
+        Bool,
+        Date,
+    }}
+
+    /// <summary>
+    /// Formats a date-like parameter into yyyy-MM-dd.
+    /// Accepts Excel dates, Unix epoch (seconds/ms), and date strings.
+    /// </summary>
+    private static string FormatDateParam(object value)
+    {{
+        if (value == null)
+        {{
+            return "";
+        }}
+        if (value is ExcelMissing || value is ExcelEmpty)
+        {{
+            return "";
+        }}
+
+        if (value is double d)
+        {{
+            return FormatDateFromNumber(d);
+        }}
+        if (value is int i)
+        {{
+            return FormatDateFromNumber(i);
+        }}
+        if (value is DateTime dt)
+        {{
+            return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }}
+        if (value is string s)
+        {{
+            s = s.Trim();
+            if (string.IsNullOrEmpty(s))
+            {{
+                return "";
+            }}
+
+            if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out double num))
+            {{
+                return FormatDateFromNumber(num);
+            }}
+
+            if (DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out DateTime parsed))
+            {{
+                return parsed.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            }}
+
+            return s;
+        }}
+
+        return value.ToString();
+    }}
+
+    private static string FormatDateFromNumber(double value)
+    {{
+        // Epoch milliseconds or seconds
+        if (value >= 1_000_000_000_000d)
+        {{
+            var dt = DateTimeOffset.FromUnixTimeMilliseconds((long)Math.Round(value)).DateTime;
+            return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }}
+        if (value >= 1_000_000_000d)
+        {{
+            var dt = DateTimeOffset.FromUnixTimeSeconds((long)Math.Round(value)).DateTime;
+            return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }}
+
+        try
+        {{
+            var dt = DateTime.FromOADate(value);
+            return dt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        }}
+        catch
+        {{
+            return value.ToString(CultureInfo.InvariantCulture);
+        }}
+    }}
+
+    private static string EscapeJsonString(string value)
+    {{
+        if (value == null)
+        {{
+            return "";
+        }}
+        return value.Replace("\\\\", "\\\\\\\\").Replace("\\"", "\\\\\\"");
+    }}
+
+    private static string SerializeParamValue(object value, ParamKind kind, bool allowArray)
+    {{
+        if (value == null || value is ExcelMissing || value is ExcelEmpty)
+        {{
+            return "null";
+        }}
+
+        if (allowArray && value is Array array)
+        {{
+            return SerializeArrayValue(array, kind);
+        }}
+
+        return SerializeScalarValue(value, kind);
+    }}
+
+    private static string SerializeArrayValue(Array array, ParamKind kind)
+    {{
+        if (array.Rank == 1)
+        {{
+            var sb = new StringBuilder();
+            sb.Append('[');
+            int start = array.GetLowerBound(0);
+            int end = array.GetUpperBound(0);
+            for (int i = start; i <= end; i++)
+            {{
+                if (i > start)
+                {{
+                    sb.Append(',');
+                }}
+                sb.Append(SerializeScalarValue(array.GetValue(i), kind));
+            }}
+            sb.Append(']');
+            return sb.ToString();
+        }}
+
+        if (array.Rank == 2)
+        {{
+            int rows = array.GetLength(0);
+            int cols = array.GetLength(1);
+            var sb = new StringBuilder();
+            sb.Append('[');
+            for (int r = 0; r < rows; r++)
+            {{
+                if (r > 0)
+                {{
+                    sb.Append(',');
+                }}
+                sb.Append('[');
+                for (int c = 0; c < cols; c++)
+                {{
+                    if (c > 0)
+                    {{
+                        sb.Append(',');
+                    }}
+                    sb.Append(SerializeScalarValue(array.GetValue(r, c), kind));
+                }}
+                sb.Append(']');
+            }}
+            sb.Append(']');
+            return sb.ToString();
+        }}
+
+        return SerializeScalarValue(array, kind);
+    }}
+
+    private static string SerializeScalarValue(object value, ParamKind kind)
+    {{
+        if (value == null || value is ExcelMissing || value is ExcelEmpty)
+        {{
+            return "null";
+        }}
+
+        switch (kind)
+        {{
+            case ParamKind.String:
+                return "\\"" + EscapeJsonString(Convert.ToString(value, CultureInfo.InvariantCulture)) + "\\"";
+            case ParamKind.Date:
+                return "\\"" + EscapeJsonString(FormatDateParam(value)) + "\\"";
+            case ParamKind.Bool:
+                if (value is bool b)
+                {{
+                    return b ? "true" : "false";
+                }}
+                if (value is double d)
+                {{
+                    return d != 0d ? "true" : "false";
+                }}
+                if (value is int i)
+                {{
+                    return i != 0 ? "true" : "false";
+                }}
+                if (value is string s)
+                {{
+                    if (bool.TryParse(s, out bool parsedBool))
+                    {{
+                        return parsedBool ? "true" : "false";
+                    }}
+                    if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out double parsedNum))
+                    {{
+                        return parsedNum != 0d ? "true" : "false";
+                    }}
+                }}
+                return "false";
+            default:
+                if (value is double num)
+                {{
+                    return num.ToString(CultureInfo.InvariantCulture);
+                }}
+                if (value is int numInt)
+                {{
+                    return numInt.ToString(CultureInfo.InvariantCulture);
+                }}
+                if (value is string str)
+                {{
+                    if (double.TryParse(str, NumberStyles.Any, CultureInfo.InvariantCulture, out double parsed))
+                    {{
+                        return parsed.ToString(CultureInfo.InvariantCulture);
+                    }}
+                    return "\\"" + EscapeJsonString(str) + "\\"";
+                }}
+                try
+                {{
+                    return Convert.ToDouble(value, CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture);
+                }}
+                catch
+                {{
+                    return "\\"" + EscapeJsonString(Convert.ToString(value, CultureInfo.InvariantCulture)) + "\\"";
+                }}
+        }}
+    }}
+
     /// <summary>
     /// Extracts the "result" field from the JSON response and returns it as Excel-friendly output.
     /// Handles single values, 1D arrays (horizontal spill), and 2D arrays (grid spill).
     /// </summary>
     private static object ParseResult(string json)
     {{
-        // Find the "result" field using regex (lightweight, no external JSON dependency)
-        var resultMatch = Regex.Match(json, @"""result""\s*:\s*(\[[\s\S]*?\]|[^,\}}]+)");
-        if (!resultMatch.Success)
+        if (!TryExtractResultValue(json, out string resultValue, out string error))
         {{
-            return "Error: No result field in response";
+            return error;
         }}
-
-        string resultValue = resultMatch.Groups[1].Value.Trim();
 
         // Check if it's a 2D array (array of arrays) like [[1,2],[3,4]]
         if (resultValue.StartsWith("[["))
@@ -427,6 +806,126 @@ public static class DominoModelFunctions
             // Single value
             return ParseSingleValue(resultValue);
         }}
+    }}
+
+    /// <summary>
+    /// Extracts the raw JSON value for the "result" field without relying on regex for nested arrays.
+    /// </summary>
+    private static bool TryExtractResultValue(string json, out string resultValue, out string error)
+    {{
+        resultValue = "";
+        error = "";
+
+        var match = Regex.Match(json, @"""result""\s*:");
+        if (!match.Success)
+        {{
+            error = "Error: No result field in response";
+            return false;
+        }}
+
+        int i = match.Index + match.Length;
+        while (i < json.Length && char.IsWhiteSpace(json[i]))
+        {{
+            i++;
+        }}
+
+        if (i >= json.Length)
+        {{
+            error = "Error: Empty result field in response";
+            return false;
+        }}
+
+        char start = json[i];
+        if (start == '[' || start == '{{')
+        {{
+            char open = start;
+            char close = (start == '[') ? ']' : '}}';
+            int depth = 0;
+            bool inString = false;
+            bool escape = false;
+            int startIndex = i;
+
+            for (; i < json.Length; i++)
+            {{
+                char ch = json[i];
+                if (inString)
+                {{
+                    if (escape)
+                    {{
+                        escape = false;
+                        continue;
+                    }}
+                    if (ch == '\\\\')
+                    {{
+                        escape = true;
+                        continue;
+                    }}
+                    if (ch == '"')
+                    {{
+                        inString = false;
+                    }}
+                    continue;
+                }}
+
+                if (ch == '"')
+                {{
+                    inString = true;
+                    continue;
+                }}
+
+                if (ch == open)
+                {{
+                    depth++;
+                }}
+                else if (ch == close)
+                {{
+                    depth--;
+                    if (depth == 0)
+                    {{
+                        resultValue = json.Substring(startIndex, i - startIndex + 1).Trim();
+                        return true;
+                    }}
+                }}
+            }}
+
+            error = "Error: Unterminated result value in response";
+            return false;
+        }}
+
+        if (start == '"')
+        {{
+            int startIndex = i;
+            bool escape = false;
+            for (i = i + 1; i < json.Length; i++)
+            {{
+                char ch = json[i];
+                if (escape)
+                {{
+                    escape = false;
+                    continue;
+                }}
+                if (ch == '\\\\')
+                {{
+                    escape = true;
+                    continue;
+                }}
+                if (ch == '"')
+                {{
+                    resultValue = json.Substring(startIndex, i - startIndex + 1).Trim();
+                    return true;
+                }}
+            }}
+            error = "Error: Unterminated string result in response";
+            return false;
+        }}
+
+        int primitiveStart = i;
+        while (i < json.Length && json[i] != ',' && json[i] != '}}' && json[i] != ']')
+        {{
+            i++;
+        }}
+        resultValue = json.Substring(primitiveStart, i - primitiveStart).Trim();
+        return true;
     }}
 
     /// <summary>
@@ -759,16 +1258,16 @@ def main():
         print("  - On Linux/Mac, you may need to build on Windows for .xll generation")
         print()
 
-        # Output the C# code so user can build manually if needed
-        print("=" * 60)
-        print("FALLBACK: Generated C# Code (copy to build manually)")
-        print("=" * 60)
-        print(generate_csharp_code(endpoints))
-        print()
-        print("=" * 60)
-        print("FALLBACK: .dna Configuration File")
-        print("=" * 60)
-        print(generate_dna_file())
+        # Write fallback artifacts to disk for manual builds
+        cs_output = os.path.join(os.getcwd(), "DominoModelFunctions.cs")
+        dna_output = os.path.join(os.getcwd(), "DominoModelFunctions.dna")
+        with open(cs_output, "w") as f:
+            f.write(generate_csharp_code(endpoints))
+        with open(dna_output, "w") as f:
+            f.write(generate_dna_file())
+        print(f"Fallback files written:")
+        print(f"  - {cs_output}")
+        print(f"  - {dna_output}")
 
 
 if __name__ == "__main__":
