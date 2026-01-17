@@ -15,6 +15,7 @@ from mlflow.types.schema import Array, ColSpec, Schema
 
 from credit_curve_model import CreditCurveModel, build_credit_curve
 from expected_loss_model import ExpectedLossModel
+from loan_inventory_model import LoanInventoryModel, build_loan_inventory
 from loan_pd_model import LoanPDModel
 from train_pd_model import train_and_save_pd_model
 
@@ -31,6 +32,7 @@ BASE_DIR = os.path.dirname(__file__)
 CODE_PATHS = [
     os.path.join(BASE_DIR, "credit_curve_model.py"),
     os.path.join(BASE_DIR, "expected_loss_model.py"),
+    os.path.join(BASE_DIR, "loan_inventory_model.py"),
     os.path.join(BASE_DIR, "loan_pd_model.py"),
 ]
 
@@ -46,19 +48,22 @@ def _pd_examples(rng: np.random.Generator):
     pd_input = pd.DataFrame(
         {
             "loan_id": [f"L{idx:03d}" for idx in range(1, row_count + 1)],
-            "fico": rng.integers(620, 780, row_count).astype(float),
-            "dti": rng.uniform(0.25, 0.55, row_count).astype(float),
-            "ltv": rng.uniform(0.7, 0.95, row_count).astype(float),
+            "credit_score": rng.integers(620, 780, row_count).astype(float),
+            "debt_to_income_ratio": rng.uniform(0.25, 0.55, row_count).astype(float),
+            "loan_to_value_ratio": rng.uniform(0.7, 0.95, row_count).astype(float),
             "loan_age_months": rng.integers(6, 60, row_count).astype(float),
-            "original_balance": rng.integers(150000, 350000, row_count).astype(float),
+            "original_principal_balance": rng.integers(150000, 350000, row_count).astype(float),
             "interest_rate": rng.uniform(0.055, 0.085, row_count).astype(float),
-            "employment_length_years": rng.integers(1, 10, row_count).astype(float),
-            "delinquency_30d_12m": rng.integers(0, 2, row_count).astype(float),
+            "employment_years": rng.integers(1, 10, row_count).astype(float),
+            "delinquency_30d_past_12m": rng.integers(0, 2, row_count).astype(float),
             "loan_purpose": rng.choice(["purchase", "refi"], row_count),
         }
     )
     pd_output = pd.DataFrame(
-        {"loan_id": pd_input["loan_id"].tolist(), "pd_1y": rng.uniform(0.01, 0.1, row_count)}
+        {
+            "loan_id": pd_input["loan_id"].tolist(),
+            "probability_of_default_1y": rng.uniform(0.01, 0.1, row_count),
+        }
     )
     return pd_input, pd_output
 
@@ -74,33 +79,39 @@ def _el_examples(
     el_input = pd.DataFrame(
         {
             "loan_id": pd_output["loan_id"].tolist(),
-            "pd_1y": pd_output["pd_1y"].astype(float).tolist(),
-            "ead": rng.integers(150000, 350000, row_count).astype(float),
-            "lgd": rng.uniform(0.35, 0.55, row_count).astype(float),
-            "rating": ratings,
-            "years_to_maturity": rng.uniform(1.0, 6.0, row_count).astype(float),
+            "probability_of_default_1y": pd_output["probability_of_default_1y"]
+            .astype(float)
+            .tolist(),
+            "exposure_at_default": rng.integers(150000, 350000, row_count).astype(float),
+            "loss_given_default": rng.uniform(0.35, 0.55, row_count).astype(float),
+            "credit_rating": ratings,
+            "remaining_term_years": rng.uniform(1.0, 6.0, row_count).astype(float),
             "curve_tenors": [curve_tenors] * row_count,
             "curve_rates": [curve_rates] * row_count,
         }
     )
-    risk_weights = [RISK_WEIGHTS.get(rating, 1.0) for rating in el_input["rating"]]
-    total_ead = int(el_input["ead"].sum())
-    el_undisc = (el_input["pd_1y"] * el_input["lgd"] * el_input["ead"]).round(2)
+    el_undisc = (
+        el_input["probability_of_default_1y"]
+        * el_input["loss_given_default"]
+        * el_input["exposure_at_default"]
+    ).round(2)
     el_disc = (el_undisc * 0.95).round(2)
-    rwa = (el_input["ead"] * np.array(risk_weights)).round(2)
+    rwa = (el_input["exposure_at_default"] * 1.0).round(2)
     el_output = pd.DataFrame(
         {
-            "loan_id": list(el_input["loan_id"]) + ["_TOTAL"],
-            "ead": list(el_input["ead"]) + [total_ead],
-            "pd_1y": list(el_input["pd_1y"]) + [None],
-            "lgd": list(el_input["lgd"]) + [None],
-            "el_undiscounted": list(el_undisc) + [float(el_undisc.sum().round(2))],
-            "el_discounted": list(el_disc) + [float(el_disc.sum().round(2))],
-            "rwa": list(rwa) + [float(rwa.sum().round(2))],
-            "risk_weight": list(risk_weights) + [None],
+            "loan_id": list(el_input["loan_id"]),
+            "el_undiscounted": list(el_undisc),
+            "el_discounted": list(el_disc),
+            "rwa": list(rwa),
         }
     )
     return el_input, el_output
+
+
+def _inventory_examples():
+    inventory_input = pd.DataFrame({"inventory_date": ["2024-12-31"]})
+    inventory_output = build_loan_inventory("2024-12-31")
+    return inventory_input, inventory_output
 
 
 def _stringify_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
@@ -438,35 +449,45 @@ def register_models():
     pd_input, pd_output = _pd_examples(np.random.default_rng(0))
 
     pd_numeric_cols = [
-        "fico",
-        "dti",
-        "ltv",
+        "credit_score",
+        "debt_to_income_ratio",
+        "loan_to_value_ratio",
         "loan_age_months",
-        "original_balance",
+        "original_principal_balance",
         "interest_rate",
-        "employment_length_years",
-        "delinquency_30d_12m",
+        "employment_years",
+        "delinquency_30d_past_12m",
     ]
     pd_input_example = _stringify_columns(pd_input, pd_numeric_cols)
     pd_signature = ModelSignature(
         inputs=Schema([ColSpec("string", name=col) for col in pd_input_example.columns]),
-        outputs=Schema([ColSpec("string", name="loan_id"), ColSpec("double", name="pd_1y")]),
+        outputs=Schema(
+            [
+                ColSpec("string", name="loan_id"),
+                ColSpec("double", name="probability_of_default_1y"),
+            ]
+        ),
     )
 
     curve_tenors = curve_output["years"].astype(float).tolist()
     curve_rates = curve_output["risk_free_rate"].astype(float).tolist()
     el_input, el_output = _el_examples(pd_output, curve_tenors, curve_rates, rng)
-    el_numeric_cols = ["pd_1y", "ead", "lgd", "years_to_maturity"]
+    el_numeric_cols = [
+        "probability_of_default_1y",
+        "exposure_at_default",
+        "loss_given_default",
+        "remaining_term_years",
+    ]
     el_input_example = _stringify_columns(el_input, el_numeric_cols)
     el_signature = ModelSignature(
         inputs=Schema(
             [
                 ColSpec("string", name="loan_id"),
-                ColSpec("string", name="pd_1y"),
-                ColSpec("string", name="ead"),
-                ColSpec("string", name="lgd"),
-                ColSpec("string", name="rating"),
-                ColSpec("string", name="years_to_maturity"),
+                ColSpec("string", name="probability_of_default_1y"),
+                ColSpec("string", name="exposure_at_default"),
+                ColSpec("string", name="loss_given_default"),
+                ColSpec("string", name="credit_rating"),
+                ColSpec("string", name="remaining_term_years"),
                 ColSpec(Array("double"), name="curve_tenors"),
                 ColSpec(Array("double"), name="curve_rates"),
             ]
@@ -474,13 +495,32 @@ def register_models():
         outputs=Schema(
             [
                 ColSpec("string", name="loan_id"),
-                ColSpec("double", name="ead"),
-                ColSpec("double", name="pd_1y"),
-                ColSpec("double", name="lgd"),
                 ColSpec("double", name="el_undiscounted"),
                 ColSpec("double", name="el_discounted"),
                 ColSpec("double", name="rwa"),
-                ColSpec("double", name="risk_weight"),
+            ]
+        ),
+    )
+
+    inventory_input, inventory_output = _inventory_examples()
+    inventory_signature = ModelSignature(
+        inputs=Schema([ColSpec("string", name="inventory_date")]),
+        outputs=Schema(
+            [
+                ColSpec("string", name="loan_id"),
+                ColSpec("double", name="credit_score"),
+                ColSpec("double", name="debt_to_income_ratio"),
+                ColSpec("double", name="loan_to_value_ratio"),
+                ColSpec("double", name="loan_age_months"),
+                ColSpec("double", name="original_principal_balance"),
+                ColSpec("double", name="interest_rate"),
+                ColSpec("double", name="employment_years"),
+                ColSpec("double", name="delinquency_30d_past_12m"),
+                ColSpec("string", name="loan_purpose"),
+                ColSpec("double", name="original_loan_term_years"),
+                ColSpec("string", name="credit_rating"),
+                ColSpec("double", name="remaining_term_years"),
+                ColSpec("double", name="loss_given_default"),
             ]
         ),
     )
@@ -498,15 +538,19 @@ def register_models():
         "spread_ratings": float(len([c for c in curve_output.columns if c.startswith("spread_")])),
     }
 
-    total_row = el_output[el_output["loan_id"] == "_TOTAL"].iloc[0]
     el_metrics = {
-        "total_el_undiscounted": float(total_row["el_undiscounted"]),
-        "total_el_discounted": float(total_row["el_discounted"]),
-        "total_rwa": float(total_row["rwa"]),
+        "total_el_undiscounted": float(el_output["el_undiscounted"].sum()),
+        "total_el_discounted": float(el_output["el_discounted"].sum()),
+        "total_rwa": float(el_output["rwa"].sum()),
     }
     el_params = {
         "example_loan_count": float(len(el_input)),
-        "distinct_risk_weights": float(len(el_output["risk_weight"].dropna().unique())),
+        "curve_length": float(len(curve_tenors)),
+    }
+
+    inventory_params = {
+        "inventory_date": str(inventory_input["inventory_date"].iloc[0]),
+        "loan_count": float(len(inventory_output)),
     }
 
     mlflow.set_experiment(_experiment_name("GetCreditCurves"))
@@ -549,10 +593,23 @@ def register_models():
             registered_model_name="GetExpectedLoss",
         )
 
+    mlflow.set_experiment(_experiment_name("GetLoanInventory"))
+    with mlflow.start_run():
+        mlflow.log_params(inventory_params)
+        inventory_model_info = mlflow.pyfunc.log_model(
+            name="GetLoanInventory",
+            python_model=LoanInventoryModel(),
+            signature=inventory_signature,
+            input_example=inventory_input,
+            code_paths=CODE_PATHS,
+            registered_model_name="GetLoanInventory",
+        )
+
     for model_name, model_info in [
         ("GetCreditCurves", curve_model_info),
         ("GetLoanProbabilityOfDefault", pd_model_info),
         ("GetExpectedLoss", el_model_info),
+        ("GetLoanInventory", inventory_model_info),
     ]:
         version = resolve_registered_model_version(model_name, model_info)
         if version is None:

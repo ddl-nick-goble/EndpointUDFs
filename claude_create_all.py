@@ -209,6 +209,28 @@ def parse_curl_command(curl_text: str) -> dict | None:
     return result if 'url' in result else None
 
 
+def extract_help_topic_url(endpoint_url: str, domino_base_url: str) -> str:
+    """
+    Generate Domino model overview URL for HelpTopic.
+
+    Extracts model_id from endpoint URL and builds a link to the model overview page.
+    Example: https://se-demo.domino.tech/models/696a8cffde2f14747436d217/latest/model
+             → https://se-demo.domino.tech/models/696a8cffde2f14747436d217/overview?ownerName=nick_goble&projectName=EndpointUDFs
+    """
+    # Extract model_id from endpoint URL (handles /api/ or /latest/model patterns)
+    match = re.search(r'/models/([a-f0-9]+)/', endpoint_url)
+    if not match:
+        return ""
+
+    model_id = match.group(1)
+    # Use the base URL from DOMINO_URL env var, strip port if present
+    base_url = domino_base_url.rstrip(':443').rstrip('/')
+
+    # Build overview URL with owner and project
+    # Note: These could be parameterized in the future if needed
+    return f"{base_url}/models/{model_id}/overview?ownerName=nick_goble&projectName=EndpointUDFs"
+
+
 def _split_param_tokens(name: str) -> list[str]:
     """Split a parameter name into lowercase tokens for heuristics."""
     if not name:
@@ -264,7 +286,19 @@ def _parse_mlflow_input_type(spec: dict[str, Any]) -> tuple[str, bool]:
         dtype = str(tensor_spec.get("dtype", "") or "")
         return _map_mlflow_type(dtype, spec.get("name", ""), None), True
 
-    array_match = re.match(r"array<([^>]+)>", type_name, flags=re.I)
+    if type_name.lower() == "array":
+        items = spec.get("items") or {}
+        if isinstance(items, dict):
+            item_type = str(items.get("type", "") or "")
+        else:
+            item_type = str(items)
+        return _map_mlflow_type(item_type, spec.get("name", ""), None), True
+
+    array_match = re.match(r"array\s*<\s*([^>]+)\s*>", type_name, flags=re.I)
+    if not array_match:
+        array_match = re.match(r"array\s*\(\s*([^)]+)\s*\)", type_name, flags=re.I)
+    if not array_match:
+        array_match = re.match(r"array\s*\[\s*([^\]]+)\s*\]", type_name, flags=re.I)
     if array_match:
         base_type = array_match.group(1)
         return _map_mlflow_type(base_type, spec.get("name", ""), None), True
@@ -284,6 +318,27 @@ def infer_parameter_type(value: Any) -> str:
         return "string"
     else:
         return "object"
+
+
+def _should_allow_reference(param_type: str) -> bool:
+    """
+    Determine if a parameter should allow cell references.
+    Numeric and date params can accept cell references for better UX.
+    """
+    return param_type in {"double", "date", "number"}
+
+
+def _infer_array_element_type(value: Any) -> str:
+    """Infer the element type for list/tuple values, handling nested lists."""
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, (list, tuple)):
+                nested_type = _infer_array_element_type(item)
+                if nested_type != "object":
+                    return nested_type
+            else:
+                return infer_parameter_type(item)
+    return "object"
 
 
 def clean_function_name(name: str) -> str:
@@ -384,8 +439,13 @@ def discover_endpoints(project_id: str) -> list[EndpointConfig]:
         # Fallback: derive parameters from example data if signature is missing
         if not parameters and isinstance(example_data, dict):
             for param_name, param_value in example_data.items():
-                param_type = infer_parameter_type(param_value)
                 is_array = isinstance(param_value, (list, tuple))
+                if is_array:
+                    param_type = _infer_array_element_type(param_value)
+                    if param_type == "object":
+                        param_type = "string"
+                else:
+                    param_type = infer_parameter_type(param_value)
                 if _is_date_param(param_name, param_value) and param_type == "string":
                     param_type = "date"
                 parameters.append({
@@ -429,7 +489,9 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
     # Build ExcelArgument attributes and parameter section
     param_section_parts = []
     for p in endpoint.parameters:
-        excel_arg = f'[ExcelArgument(Name = "{p["name"]}", Description = "{p["description"]}")]'
+        # Allow reference for array inputs or numeric/date params.
+        allow_ref_str = "true" if p.get("is_array") or _should_allow_reference(p["type"]) else "false"
+        excel_arg = f'[ExcelArgument(Name = "{p["name"]}", Description = "{p["description"]}", AllowReference = {allow_ref_str})]'
         param_type = "object"
         param_section_parts.append(f'{excel_arg} {param_type} {p["name"]}')
 
@@ -474,6 +536,10 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
     # Excel function name with Domino. prefix
     excel_function_name = f"Domino.{endpoint.name}"
 
+    # Generate HelpTopic URL if possible
+    help_topic_url = extract_help_topic_url(endpoint.url, DOMINO_URL)
+    help_topic_line = f',\n            HelpTopic = "{help_topic_url}"' if help_topic_url else ''
+
     method = f'''
         /// <summary>
         /// {endpoint.description}
@@ -484,7 +550,8 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
             Description = "{escaped_description}",
             Category = "Domino Model APIs",
             IsVolatile = false,
-            IsExceptionSafe = true
+            IsExceptionSafe = true,
+            IsThreadSafe = true{help_topic_line}
         )]
         public static object {endpoint.name}(
             {param_section})
@@ -647,8 +714,25 @@ public static class DominoModelFunctions
         return value.Replace("\\\\", "\\\\\\\\").Replace("\\"", "\\\\\\"");
     }}
 
+    private static object NormalizeExcelValue(object value)
+    {{
+        if (value is ExcelReference excelRef)
+        {{
+            try
+            {{
+                value = excelRef.GetValue();
+            }}
+            catch
+            {{
+                return value;
+            }}
+        }}
+        return value;
+    }}
+
     private static string SerializeParamValue(object value, ParamKind kind, bool allowArray)
     {{
+        value = NormalizeExcelValue(value);
         if (value == null || value is ExcelMissing || value is ExcelEmpty)
         {{
             return "null";
@@ -659,7 +743,17 @@ public static class DominoModelFunctions
             return SerializeArrayValue(array, kind);
         }}
 
+        if (!allowArray && value is Array singleCell && singleCell.Rank == 2 && singleCell.GetLength(0) == 1 && singleCell.GetLength(1) == 1)
+        {{
+            return SerializeScalarValue(singleCell.GetValue(0, 0), kind);
+        }}
+
         return SerializeScalarValue(value, kind);
+    }}
+
+    private static bool IsEmptyCell(object value)
+    {{
+        return value == null || value is ExcelMissing || value is ExcelEmpty || value is ExcelError;
     }}
 
     private static string SerializeArrayValue(Array array, ParamKind kind)
@@ -670,13 +764,20 @@ public static class DominoModelFunctions
             sb.Append('[');
             int start = array.GetLowerBound(0);
             int end = array.GetUpperBound(0);
+            bool appended = false;
             for (int i = start; i <= end; i++)
             {{
-                if (i > start)
+                object value = array.GetValue(i);
+                if (IsEmptyCell(value))
+                {{
+                    continue;
+                }}
+                if (appended)
                 {{
                     sb.Append(',');
                 }}
-                sb.Append(SerializeScalarValue(array.GetValue(i), kind));
+                sb.Append(kind == ParamKind.Number ? SerializeScalarValue(Convert.ToString(value, CultureInfo.InvariantCulture), ParamKind.String) : SerializeScalarValue(value, kind));
+                appended = true;
             }}
             sb.Append(']');
             return sb.ToString();
@@ -688,6 +789,29 @@ public static class DominoModelFunctions
             int cols = array.GetLength(1);
             var sb = new StringBuilder();
             sb.Append('[');
+
+            if (rows == 1 || cols == 1)
+            {{
+                int count = rows == 1 ? cols : rows;
+                bool appended = false;
+                for (int i = 0; i < count; i++)
+                {{
+                    object value = rows == 1 ? array.GetValue(0, i) : array.GetValue(i, 0);
+                    if (IsEmptyCell(value))
+                    {{
+                        continue;
+                    }}
+                    if (appended)
+                    {{
+                        sb.Append(',');
+                    }}
+                    sb.Append(kind == ParamKind.Number ? SerializeScalarValue(Convert.ToString(value, CultureInfo.InvariantCulture), ParamKind.String) : SerializeScalarValue(value, kind));
+                    appended = true;
+                }}
+                sb.Append(']');
+                return sb.ToString();
+            }}
+
             for (int r = 0; r < rows; r++)
             {{
                 if (r > 0)
@@ -695,13 +819,20 @@ public static class DominoModelFunctions
                     sb.Append(',');
                 }}
                 sb.Append('[');
+                bool appended = false;
                 for (int c = 0; c < cols; c++)
                 {{
-                    if (c > 0)
+                    object value = array.GetValue(r, c);
+                    if (IsEmptyCell(value))
+                    {{
+                        continue;
+                    }}
+                    if (appended)
                     {{
                         sb.Append(',');
                     }}
-                    sb.Append(SerializeScalarValue(array.GetValue(r, c), kind));
+                    sb.Append(kind == ParamKind.Number ? SerializeScalarValue(Convert.ToString(value, CultureInfo.InvariantCulture), ParamKind.String) : SerializeScalarValue(value, kind));
+                    appended = true;
                 }}
                 sb.Append(']');
             }}
@@ -751,31 +882,49 @@ public static class DominoModelFunctions
                 }}
                 return "false";
             default:
-                if (value is double num)
-                {{
-                    return num.ToString(CultureInfo.InvariantCulture);
-                }}
-                if (value is int numInt)
-                {{
-                    return numInt.ToString(CultureInfo.InvariantCulture);
-                }}
-                if (value is string str)
-                {{
-                    if (double.TryParse(str, NumberStyles.Any, CultureInfo.InvariantCulture, out double parsed))
-                    {{
-                        return parsed.ToString(CultureInfo.InvariantCulture);
-                    }}
-                    return "\\"" + EscapeJsonString(str) + "\\"";
-                }}
-                try
-                {{
-                    return Convert.ToDouble(value, CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture);
-                }}
-                catch
-                {{
-                    return "\\"" + EscapeJsonString(Convert.ToString(value, CultureInfo.InvariantCulture)) + "\\"";
-                }}
+                return SerializeNumberValue(value, false);
         }}
+    }}
+
+    private static string SerializeNumberValue(object value, bool forceFloat)
+    {{
+        if (value is double num)
+        {{
+            return FormatNumber(num, forceFloat);
+        }}
+        if (value is int numInt)
+        {{
+            return FormatNumber(numInt, forceFloat);
+        }}
+        if (value is string str)
+        {{
+            if (double.TryParse(str, NumberStyles.Any, CultureInfo.InvariantCulture, out double parsed))
+            {{
+                return FormatNumber(parsed, forceFloat);
+            }}
+            return "\\"" + EscapeJsonString(str) + "\\"";
+        }}
+        try
+        {{
+            return FormatNumber(Convert.ToDouble(value, CultureInfo.InvariantCulture), forceFloat);
+        }}
+        catch
+        {{
+            return "\\"" + EscapeJsonString(Convert.ToString(value, CultureInfo.InvariantCulture)) + "\\"";
+        }}
+    }}
+
+    private static string FormatNumber(double value, bool forceFloat)
+    {{
+        if (!forceFloat)
+        {{
+            return value.ToString(CultureInfo.InvariantCulture);
+        }}
+        if (Math.Abs(value % 1) < 1e-12)
+        {{
+            return value.ToString("0.0", CultureInfo.InvariantCulture);
+        }}
+        return value.ToString(CultureInfo.InvariantCulture);
     }}
 
     /// <summary>
@@ -1177,6 +1326,14 @@ def build_addin(endpoints: list[EndpointConfig]) -> str | None:
         print(f"[6/6] Add-in created successfully!")
         for arch, path in copied_files:
             print(f"       {arch}: {path}")
+
+        # Write source files for reference
+        cs_output = os.path.join(os.getcwd(), "DominoModelFunctions.cs")
+        dna_output = os.path.join(os.getcwd(), "DominoModelFunctions.dna")
+        with open(cs_output, "w") as f:
+            f.write(generate_csharp_code(endpoints))
+        with open(dna_output, "w") as f:
+            f.write(generate_dna_file())
 
         print()
         print("=" * 60)

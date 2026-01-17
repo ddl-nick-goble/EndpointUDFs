@@ -10,14 +10,22 @@ from credit_curve_model import RATINGS, _spreads
 
 REQUIRED_COLS = [
     "loan_id",
-    "pd_1y",
-    "ead",
-    "lgd",
-    "rating",
-    "years_to_maturity",
+    "probability_of_default_1y",
+    "exposure_at_default",
+    "loss_given_default",
+    "credit_rating",
+    "remaining_term_years",
     "curve_tenors",
     "curve_rates",
 ]
+
+INPUT_ALIASES = {
+    "pd_1y": "probability_of_default_1y",
+    "ead": "exposure_at_default",
+    "lgd": "loss_given_default",
+    "rating": "credit_rating",
+    "years_to_maturity": "remaining_term_years",
+}
 
 RISK_WEIGHTS = {
     "AAA": 0.20,
@@ -38,7 +46,21 @@ def _ensure_columns(model_input: pd.DataFrame, columns: List[str]) -> None:
 
 def _coerce_numeric(model_input: pd.DataFrame, columns: List[str]) -> None:
     for col in columns:
+        before_na = int(model_input[col].isna().sum()) if col in model_input.columns else -1
         model_input[col] = pd.to_numeric(model_input[col], errors="coerce")
+        after_na = int(model_input[col].isna().sum())
+        print(f"[ExpectedLossModel] Coerce numeric '{col}': NaN before={before_na} after={after_na}")
+
+
+def _apply_aliases(model_input: pd.DataFrame) -> pd.DataFrame:
+    rename_map = {}
+    for old, new in INPUT_ALIASES.items():
+        if new not in model_input.columns and old in model_input.columns:
+            rename_map[old] = new
+    if not rename_map:
+        return model_input
+    print(f"[ExpectedLossModel] Applying aliases: {rename_map}")
+    return model_input.rename(columns=rename_map)
 
 
 def get_risky_discount_factor(
@@ -56,14 +78,21 @@ def get_risky_discount_factor(
 
 
 def compute_expected_loss(row: pd.Series, curve_df: pd.DataFrame) -> Tuple[float, float, float]:
-    el_undisc = row["pd_1y"] * row["lgd"] * row["ead"]
-    df = get_risky_discount_factor(curve_df, row["rating"], row["years_to_maturity"])
+    el_undisc = (
+        row["probability_of_default_1y"]
+        * row["loss_given_default"]
+        * row["exposure_at_default"]
+    )
+    df = get_risky_discount_factor(curve_df, row["credit_rating"], row["remaining_term_years"])
     el_disc = el_undisc * df
-    rwa = row["ead"] * RISK_WEIGHTS.get(row["rating"], 1.0)
+    rwa = row["exposure_at_default"] * RISK_WEIGHTS.get(row["credit_rating"], 1.0)
+    if not np.isfinite([el_undisc, el_disc, rwa]).all():
+        raise ValueError("Computed values contain NaN or Inf")
     return float(el_undisc), float(el_disc), float(rwa)
 
 
 def _coerce_curve_array(value, label: str) -> np.ndarray:
+    print(f"[ExpectedLossModel] Raw {label} type={type(value).__name__} value={value}")
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -71,7 +100,11 @@ def _coerce_curve_array(value, label: str) -> np.ndarray:
             raise ValueError(f"Invalid {label} JSON array") from exc
     if value is None:
         raise ValueError(f"Missing {label}")
-    return np.asarray(value, dtype=float)
+    arr = np.asarray(value, dtype=float)
+    print(f"[ExpectedLossModel] Coerced {label} dtype={arr.dtype} shape={arr.shape} sample={arr[:5] if arr.size else arr}")
+    if not np.isfinite(arr).all():
+        raise ValueError(f"Invalid {label}: contains NaN or Inf")
+    return arr
 
 
 def _curve_from_arrays(curve_tenors, curve_rates) -> pd.DataFrame:
@@ -90,40 +123,39 @@ def _curve_from_arrays(curve_tenors, curve_rates) -> pd.DataFrame:
 
 class ExpectedLossModel(mlflow.pyfunc.PythonModel):
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
+        print(f"[ExpectedLossModel] Input columns: {list(model_input.columns)} rows={len(model_input)}")
+        print(f"[ExpectedLossModel] Input head:\n{model_input.head(3)}")
+        model_input = _apply_aliases(model_input)
         _ensure_columns(model_input, REQUIRED_COLS)
-        _coerce_numeric(model_input, ["pd_1y", "ead", "lgd", "years_to_maturity"])
+        _coerce_numeric(
+            model_input,
+            [
+                "probability_of_default_1y",
+                "exposure_at_default",
+                "loss_given_default",
+                "remaining_term_years",
+            ],
+        )
 
         curve_tenors = model_input["curve_tenors"].iloc[0]
         curve_rates = model_input["curve_rates"].iloc[0]
         curve_df = _curve_from_arrays(curve_tenors, curve_rates)
+        print(f"[ExpectedLossModel] Curve df head:\n{curve_df.head(3)}")
 
         results = []
         for _, row in model_input.iterrows():
+            print(f"[ExpectedLossModel] Row loan_id={row['loan_id']} rating={row['credit_rating']} term={row['remaining_term_years']}")
             el_u, el_d, rwa = compute_expected_loss(row, curve_df)
-            risk_weight = RISK_WEIGHTS.get(row["rating"], 1.0)
+            risk_weight = RISK_WEIGHTS.get(row["credit_rating"], 1.0)
             results.append(
                 {
                     "loan_id": row["loan_id"],
-                    "ead": row["ead"],
-                    "pd_1y": row["pd_1y"],
-                    "lgd": row["lgd"],
                     "el_undiscounted": el_u,
                     "el_discounted": el_d,
                     "rwa": rwa,
-                    "risk_weight": risk_weight,
                 }
             )
 
-        totals = {
-            "loan_id": "_TOTAL",
-            "ead": float(model_input["ead"].sum()),
-            "pd_1y": None,
-            "lgd": None,
-            "el_undiscounted": float(sum(row["el_undiscounted"] for row in results)),
-            "el_discounted": float(sum(row["el_discounted"] for row in results)),
-            "rwa": float(sum(row["rwa"] for row in results)),
-            "risk_weight": None,
-        }
-        results.append(totals)
-
-        return pd.DataFrame(results)
+        output = pd.DataFrame(results)
+        print(f"[ExpectedLossModel] Output head:\n{output.head(3)}")
+        return output
