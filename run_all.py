@@ -1354,6 +1354,21 @@ def build_addin(endpoints: list[EndpointConfig]) -> str | None:
             print(f"    {ep.description[:70]}...")
             print()
 
+        artifacts_dir = "/mnt/artifacts"
+        os.makedirs(artifacts_dir, exist_ok=True)
+        source_64 = "/mnt/code/DominoModelFunctions-AddIn64.xll"
+        source_32 = "/mnt/code/DominoModelFunctions-AddIn.xll"
+        dest_64 = os.path.join(artifacts_dir, "DominoExcelUDFsAddIn64.xll")
+        dest_32 = os.path.join(artifacts_dir, "DominoExcelUDFsAddIn.xll")
+        if os.path.exists(source_64):
+            shutil.copy(source_64, dest_64)
+        else:
+            print(f"Warning: missing source file {source_64}")
+        if os.path.exists(source_32):
+            shutil.copy(source_32, dest_32)
+        else:
+            print(f"Warning: missing source file {source_32}")
+
         return copied_files[0][1] if copied_files else None
 
     finally:
