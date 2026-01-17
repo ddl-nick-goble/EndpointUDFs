@@ -10,8 +10,10 @@ import mlflow
 import pandas as pd
 import requests
 from mlflow.models import infer_signature
+from mlflow.models.signature import ModelSignature
+from mlflow.types.schema import Array, ColSpec, Schema
 
-from credit_curve_model import CreditCurveModel, build_credit_curve, curve_to_json
+from credit_curve_model import CreditCurveModel, build_credit_curve
 from expected_loss_model import ExpectedLossModel
 from loan_pd_model import LoanPDModel
 from train_pd_model import train_and_save_pd_model
@@ -61,18 +63,24 @@ def _pd_examples(rng: np.random.Generator):
     return pd_input, pd_output
 
 
-def _el_examples(curve_json: str, rng: np.random.Generator):
-    row_count = int(rng.choice([2, 3, 4]))
+def _el_examples(
+    pd_output: pd.DataFrame,
+    curve_tenors: list[float],
+    curve_rates: list[float],
+    rng: np.random.Generator,
+):
+    row_count = len(pd_output)
     ratings = rng.choice(["AAA", "AA", "A", "BBB", "BB"], row_count)
     el_input = pd.DataFrame(
         {
-            "loan_id": [f"L{idx:03d}" for idx in range(1, row_count + 1)],
-            "pd_1y": rng.uniform(0.01, 0.12, row_count).astype(float),
+            "loan_id": pd_output["loan_id"].tolist(),
+            "pd_1y": pd_output["pd_1y"].astype(float).tolist(),
             "ead": rng.integers(150000, 350000, row_count).astype(float),
             "lgd": rng.uniform(0.35, 0.55, row_count).astype(float),
             "rating": ratings,
             "years_to_maturity": rng.uniform(1.0, 6.0, row_count).astype(float),
-            "curve_json": [curve_json] * row_count,
+            "curve_tenors": [curve_tenors] * row_count,
+            "curve_rates": [curve_rates] * row_count,
         }
     )
     risk_weights = [RISK_WEIGHTS.get(rating, 1.0) for rating in el_input["rating"]]
@@ -93,6 +101,14 @@ def _el_examples(curve_json: str, rng: np.random.Generator):
         }
     )
     return el_input, el_output
+
+
+def _stringify_columns(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    result = df.copy()
+    for col in columns:
+        if col in result.columns:
+            result[col] = result[col].map(lambda val: "" if pd.isna(val) else str(val))
+    return result
 
 
 def domino_short_id(length: int = 8) -> str:
@@ -419,12 +435,55 @@ def register_models():
     curve_input, curve_output = _curve_examples()
     curve_signature = infer_signature(curve_input, curve_output)
 
-    pd_input, pd_output = _pd_examples(rng)
-    pd_signature = infer_signature(pd_input, pd_output)
+    pd_input, pd_output = _pd_examples(np.random.default_rng(0))
 
-    curve_json = curve_to_json(curve_output)
-    el_input, el_output = _el_examples(curve_json, rng)
-    el_signature = infer_signature(el_input, el_output)
+    pd_numeric_cols = [
+        "fico",
+        "dti",
+        "ltv",
+        "loan_age_months",
+        "original_balance",
+        "interest_rate",
+        "employment_length_years",
+        "delinquency_30d_12m",
+    ]
+    pd_input_example = _stringify_columns(pd_input, pd_numeric_cols)
+    pd_signature = ModelSignature(
+        inputs=Schema([ColSpec("string", name=col) for col in pd_input_example.columns]),
+        outputs=Schema([ColSpec("string", name="loan_id"), ColSpec("double", name="pd_1y")]),
+    )
+
+    curve_tenors = curve_output["years"].astype(float).tolist()
+    curve_rates = curve_output["risk_free_rate"].astype(float).tolist()
+    el_input, el_output = _el_examples(pd_output, curve_tenors, curve_rates, rng)
+    el_numeric_cols = ["pd_1y", "ead", "lgd", "years_to_maturity"]
+    el_input_example = _stringify_columns(el_input, el_numeric_cols)
+    el_signature = ModelSignature(
+        inputs=Schema(
+            [
+                ColSpec("string", name="loan_id"),
+                ColSpec("string", name="pd_1y"),
+                ColSpec("string", name="ead"),
+                ColSpec("string", name="lgd"),
+                ColSpec("string", name="rating"),
+                ColSpec("string", name="years_to_maturity"),
+                ColSpec(Array("double"), name="curve_tenors"),
+                ColSpec(Array("double"), name="curve_rates"),
+            ]
+        ),
+        outputs=Schema(
+            [
+                ColSpec("string", name="loan_id"),
+                ColSpec("double", name="ead"),
+                ColSpec("double", name="pd_1y"),
+                ColSpec("double", name="lgd"),
+                ColSpec("double", name="el_undiscounted"),
+                ColSpec("double", name="el_discounted"),
+                ColSpec("double", name="rwa"),
+                ColSpec("double", name="risk_weight"),
+            ]
+        ),
+    )
 
     curve_metrics = {
         "avg_risk_free_rate": float(curve_output["risk_free_rate"].mean()),
@@ -472,7 +531,7 @@ def register_models():
             python_model=LoanPDModel(),
             artifacts={"xgb_model": model_path},
             signature=pd_signature,
-            input_example=pd_input,
+            input_example=pd_input_example,
             code_paths=CODE_PATHS,
             registered_model_name="GetLoanProbabilityOfDefault",
         )
@@ -485,7 +544,7 @@ def register_models():
             name="GetExpectedLoss",
             python_model=ExpectedLossModel(),
             signature=el_signature,
-            input_example=el_input,
+            input_example=el_input_example,
             code_paths=CODE_PATHS,
             registered_model_name="GetExpectedLoss",
         )

@@ -430,9 +430,7 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
     param_section_parts = []
     for p in endpoint.parameters:
         excel_arg = f'[ExcelArgument(Name = "{p["name"]}", Description = "{p["description"]}")]'
-        param_type = p["type"]
-        if p.get("is_array") or param_type == "date":
-            param_type = "object"
+        param_type = "object"
         param_section_parts.append(f'{excel_arg} {param_type} {p["name"]}')
 
     param_section = ", ".join(param_section_parts)

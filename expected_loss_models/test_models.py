@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from credit_curve_model import CreditCurveModel, curve_to_json
+from credit_curve_model import CreditCurveModel
 from expected_loss_model import ExpectedLossModel
 from loan_pd_model import LoanPDModel
 from train_pd_model import train_and_save_pd_model
@@ -16,7 +16,8 @@ class _DummyContext:
 def run_smoke_test():
     curve_in = pd.DataFrame({"curve_date": ["2024-12-31"]})
     curve_out = CreditCurveModel().predict(None, curve_in)
-    curve_json = curve_to_json(curve_out)
+    curve_tenors = curve_out["years"].astype(float).tolist()
+    curve_rates = curve_out["risk_free_rate"].astype(float).tolist()
 
     model_path = Path("pd_model.json")
     if not model_path.exists():
@@ -46,7 +47,8 @@ def run_smoke_test():
     el_in["lgd"] = [0.40, 0.45]
     el_in["rating"] = ["A", "BBB"]
     el_in["years_to_maturity"] = [4.5, 2.0]
-    el_in["curve_json"] = curve_json
+    el_in["curve_tenors"] = [curve_tenors] * len(el_in)
+    el_in["curve_rates"] = [curve_rates] * len(el_in)
 
     el_out = ExpectedLossModel().predict(None, el_in)
     print(el_out)

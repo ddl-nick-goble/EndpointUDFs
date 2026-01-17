@@ -1,10 +1,12 @@
 from typing import List, Tuple
 
+import json
+
 import mlflow.pyfunc
 import numpy as np
 import pandas as pd
 
-from credit_curve_model import json_to_curve
+from credit_curve_model import RATINGS, _spreads
 
 REQUIRED_COLS = [
     "loan_id",
@@ -13,7 +15,8 @@ REQUIRED_COLS = [
     "lgd",
     "rating",
     "years_to_maturity",
-    "curve_json",
+    "curve_tenors",
+    "curve_rates",
 ]
 
 RISK_WEIGHTS = {
@@ -60,13 +63,39 @@ def compute_expected_loss(row: pd.Series, curve_df: pd.DataFrame) -> Tuple[float
     return float(el_undisc), float(el_disc), float(rwa)
 
 
+def _coerce_curve_array(value, label: str) -> np.ndarray:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid {label} JSON array") from exc
+    if value is None:
+        raise ValueError(f"Missing {label}")
+    return np.asarray(value, dtype=float)
+
+
+def _curve_from_arrays(curve_tenors, curve_rates) -> pd.DataFrame:
+    tenors = _coerce_curve_array(curve_tenors, "curve_tenors")
+    rates = _coerce_curve_array(curve_rates, "curve_rates")
+    if tenors.shape != rates.shape:
+        raise ValueError("curve_tenors and curve_rates must have matching lengths")
+    curve_date = "static"
+    data = {"years": tenors, "risk_free_rate": rates}
+    for rating in RATINGS:
+        data[f"spread_{rating}"] = [
+            _spreads(float(years), curve_date)[rating] for years in tenors
+        ]
+    return pd.DataFrame(data).sort_values("years")
+
+
 class ExpectedLossModel(mlflow.pyfunc.PythonModel):
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
         _ensure_columns(model_input, REQUIRED_COLS)
         _coerce_numeric(model_input, ["pd_1y", "ead", "lgd", "years_to_maturity"])
 
-        curve_json = model_input["curve_json"].iloc[0]
-        curve_df = json_to_curve(curve_json).sort_values("years")
+        curve_tenors = model_input["curve_tenors"].iloc[0]
+        curve_rates = model_input["curve_rates"].iloc[0]
+        curve_df = _curve_from_arrays(curve_tenors, curve_rates)
 
         results = []
         for _, row in model_input.iterrows():
