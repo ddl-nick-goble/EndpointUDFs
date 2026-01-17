@@ -16,7 +16,7 @@ TENORS = [
     ("10Y", 10.0),
 ]
 
-RATINGS = ["AAA", "AA", "A", "BBB", "BB"]
+RATINGS = ["AAA", "AA", "A", "BBB", "BB", "B"]
 
 
 def _date_tweak(curve_date: str) -> float:
@@ -45,6 +45,7 @@ def _spreads(years: float, curve_date: str) -> Dict[str, float]:
         "A": 0.0120,
         "BBB": 0.0180,
         "BB": 0.0350,
+        "B": 0.0550,
     }
     term_widen = {
         "AAA": 0.0003,
@@ -52,6 +53,7 @@ def _spreads(years: float, curve_date: str) -> Dict[str, float]:
         "A": 0.0006,
         "BBB": 0.0009,
         "BB": 0.0012,
+        "B": 0.0018,
     }
     return {
         rating: base[rating] + term_widen[rating] * years + _spread_tweak(curve_date, rating)
