@@ -29,6 +29,7 @@ import requests
 DOMINO_URL = os.environ.get("DOMINO_URL", "https://se-demo.domino.tech:443")
 API_KEY = os.environ.get("DOMINO_USER_API_KEY", "")
 PROJECT_ID = os.environ.get("DOMINO_PROJECT_ID", "")
+PROJECT_NAME = os.environ.get("DOMINO_PROJECT_NAME", "")
 
 
 @dataclass
@@ -341,7 +342,7 @@ def _infer_array_element_type(value: Any) -> str:
     return "object"
 
 
-def clean_function_name(name: str) -> str:
+def clean_function_name(name: str, prefix: str = "Model") -> str:
     """
     Clean a model name for use as a function name.
     Only applies CamelCase transformation if there's punctuation/spaces to remove.
@@ -362,11 +363,30 @@ def clean_function_name(name: str) -> str:
 
     # Ensure it starts with a letter
     if camel and camel[0].isdigit():
-        camel = 'Model' + camel
-    return camel or 'UnnamedModel'
+        camel = prefix + camel
+    return camel or f'Unnamed{prefix}'
 
 
-def discover_endpoints(project_id: str) -> list[EndpointConfig]:
+def get_project_name(project_id: str) -> str:
+    """Get the project name from environment variable or Domino API."""
+    if PROJECT_NAME:
+        return clean_function_name(PROJECT_NAME, prefix="Project")
+
+    url = f"{DOMINO_URL}/v4/projects/{project_id}"
+    headers = {"X-Domino-Api-Key": API_KEY}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        name = resp.json().get("name", "")
+        if name:
+            return clean_function_name(name, prefix="Project")
+    except Exception:
+        pass
+
+    return ""
+
+
+def discover_endpoints(project_id: str, project_name: str) -> list[EndpointConfig]:
     """
     Discover all model endpoints in a project and build EndpointConfig objects.
     """
@@ -474,7 +494,8 @@ def discover_endpoints(project_id: str) -> list[EndpointConfig]:
         )
         endpoints.append(endpoint)
         param_names = ", ".join([p["name"] for p in parameters])
-        print(f"    Found: Domino.{function_name}({param_names})")
+        excel_function_name = f"Domino.{project_name}.{function_name}" if project_name else f"Domino.{function_name}"
+        print(f"    Found: {excel_function_name}({param_names})")
 
     return endpoints
 
@@ -483,7 +504,7 @@ def discover_endpoints(project_id: str) -> list[EndpointConfig]:
 # Code Generation Functions (from claude_create_udfs.py)
 # =============================================================================
 
-def generate_udf_method(endpoint: EndpointConfig) -> str:
+def generate_udf_method(endpoint: EndpointConfig, project_name: str) -> str:
     """Generate a C# UDF method for a single endpoint."""
 
     # Build ExcelArgument attributes and parameter section
@@ -534,7 +555,10 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
     escaped_description = endpoint.description.replace('"', '\\"')
 
     # Excel function name with Domino. prefix
-    excel_function_name = f"Domino.{endpoint.name}"
+    if project_name:
+        excel_function_name = f"Domino.{project_name}.{endpoint.name}"
+    else:
+        excel_function_name = f"Domino.{endpoint.name}"
 
     # Generate HelpTopic URL if possible
     help_topic_url = extract_help_topic_url(endpoint.url, DOMINO_URL)
@@ -593,13 +617,17 @@ def generate_udf_method(endpoint: EndpointConfig) -> str:
     return method
 
 
-def generate_csharp_code(endpoints: list[EndpointConfig]) -> str:
+def generate_csharp_code(endpoints: list[EndpointConfig], project_name: str) -> str:
     """Generate the complete C# add-in code."""
 
-    methods = "\n".join([generate_udf_method(ep) for ep in endpoints])
+    methods = "\n".join([generate_udf_method(ep, project_name) for ep in endpoints])
 
     # Build function documentation
-    func_docs = "\n".join([f"/// - Domino.{ep.name}: {ep.description[:60]}..." for ep in endpoints])
+    func_docs = "\n".join([
+        f"/// - Domino.{project_name}.{ep.name}: {ep.description[:60]}..."
+        if project_name else f"/// - Domino.{ep.name}: {ep.description[:60]}..."
+        for ep in endpoints
+    ])
 
     code = f'''using System;
 using System.Collections.Generic;
@@ -1194,16 +1222,19 @@ public static class DominoModelFunctions
     return code
 
 
-def generate_dna_file() -> str:
+def generate_dna_file(project_name: str) -> str:
     """Generate the Excel-DNA .dna configuration file."""
+    addin_name = "Domino endpoint UDFs for project"
+    if project_name:
+        addin_name = f"{addin_name} - {project_name}"
     return '''<?xml version="1.0" encoding="utf-8"?>
-<DnaLibrary Name="Domino Model APIs Add-In" RuntimeVersion="v4.0">
+<DnaLibrary Name="''' + addin_name + '''" RuntimeVersion="v4.0">
   <ExternalLibrary Path="DominoModelFunctions.dll" ExplicitExports="false" LoadFromBytes="true" Pack="true" />
 </DnaLibrary>
 '''
 
 
-def build_addin(endpoints: list[EndpointConfig]) -> str | None:
+def build_addin(endpoints: list[EndpointConfig], project_name: str) -> str | None:
     """Build the Excel-DNA add-in."""
 
     if not endpoints:
@@ -1224,16 +1255,17 @@ def build_addin(endpoints: list[EndpointConfig]) -> str | None:
         # Write the C# code
         cs_file = os.path.join(build_dir, "DominoModelFunctions.cs")
         with open(cs_file, "w") as f:
-            f.write(generate_csharp_code(endpoints))
+            f.write(generate_csharp_code(endpoints, project_name))
         print(f"[2/6] Generated C# source code with {len(endpoints)} UDF(s):")
         for ep in endpoints:
             params = ", ".join([p["name"] for p in ep.parameters])
-            print(f"       - Domino.{ep.name}({params})")
+            function_name = f"Domino.{project_name}.{ep.name}" if project_name else f"Domino.{ep.name}"
+            print(f"       - {function_name}({params})")
 
         # Write the .dna file
         dna_file = os.path.join(build_dir, "DominoModelFunctions.dna")
         with open(dna_file, "w") as f:
-            f.write(generate_dna_file())
+            f.write(generate_dna_file(project_name))
         print("[3/6] Generated Excel-DNA configuration file")
 
         # Create a .csproj file for building
@@ -1331,9 +1363,9 @@ def build_addin(endpoints: list[EndpointConfig]) -> str | None:
         cs_output = os.path.join(os.getcwd(), "DominoModelFunctions.cs")
         dna_output = os.path.join(os.getcwd(), "DominoModelFunctions.dna")
         with open(cs_output, "w") as f:
-            f.write(generate_csharp_code(endpoints))
+            f.write(generate_csharp_code(endpoints, project_name))
         with open(dna_output, "w") as f:
-            f.write(generate_dna_file())
+            f.write(generate_dna_file(project_name))
 
         print()
         print("=" * 60)
@@ -1350,7 +1382,8 @@ def build_addin(endpoints: list[EndpointConfig]) -> str | None:
         print("Available functions:")
         for ep in endpoints:
             params = ", ".join([p["name"] for p in ep.parameters])
-            print(f"  =Domino.{ep.name}({params})")
+            function_name = f"Domino.{project_name}.{ep.name}" if project_name else f"Domino.{ep.name}"
+            print(f"  ={function_name}({params})")
             print(f"    {ep.description[:70]}...")
             print()
 
@@ -1398,10 +1431,12 @@ def main():
     print(f"Project ID: {project_id}")
     print()
 
+    project_name = get_project_name(project_id)
+
     # Step 1: Discover endpoints
     print("Step 1: Discovering model endpoints...")
     print("-" * 40)
-    endpoints = discover_endpoints(project_id)
+    endpoints = discover_endpoints(project_id, project_name)
 
     if not endpoints:
         print()
@@ -1420,7 +1455,7 @@ def main():
     print("-" * 40)
 
     try:
-        build_addin(endpoints)
+        build_addin(endpoints, project_name)
     except Exception as e:
         print(f"\nBuild Error: {e}")
         print("\nTroubleshooting:")
@@ -1432,9 +1467,9 @@ def main():
         cs_output = os.path.join(os.getcwd(), "DominoModelFunctions.cs")
         dna_output = os.path.join(os.getcwd(), "DominoModelFunctions.dna")
         with open(cs_output, "w") as f:
-            f.write(generate_csharp_code(endpoints))
+            f.write(generate_csharp_code(endpoints, project_name))
         with open(dna_output, "w") as f:
-            f.write(generate_dna_file())
+            f.write(generate_dna_file(project_name))
         print(f"Fallback files written:")
         print(f"  - {cs_output}")
         print(f"  - {dna_output}")
