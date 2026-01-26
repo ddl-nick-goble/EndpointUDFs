@@ -1,0 +1,166 @@
+{
+  "functions": [
+    {
+      "id": "GETCREDITCURVESAPI",
+      "name": "DOMINO.ENDPOINTUDFS.GETCREDITCURVESAPI",
+      "description": "Calls the GetCreditCurvesApi Domino model API endpoint.",
+      "parameters": [
+        {
+          "name": "curve_date",
+          "description": "The curve_date parameter for the model",
+          "type": "any"
+        }
+      ],
+      "result": {
+        "type": "any",
+        "dimensionality": "matrix"
+      },
+      "options": {
+        "stream": false,
+        "cancelable": false
+      }
+    },
+    {
+      "id": "GETLOANPROBABILITYOFDEFAULTAPI",
+      "name": "DOMINO.ENDPOINTUDFS.GETLOANPROBABILITYOFDEFAULTAPI",
+      "description": "Calls the GetLoanProbabilityOfDefaultApi Domino model API endpoint.",
+      "parameters": [
+        {
+          "name": "loan_id",
+          "description": "The loan_id parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "credit_score",
+          "description": "The credit_score parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "debt_to_income_ratio",
+          "description": "The debt_to_income_ratio parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "loan_to_value_ratio",
+          "description": "The loan_to_value_ratio parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "loan_age_months",
+          "description": "The loan_age_months parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "original_principal_balance",
+          "description": "The original_principal_balance parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "interest_rate",
+          "description": "The interest_rate parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "employment_years",
+          "description": "The employment_years parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "delinquency_30d_past_12m",
+          "description": "The delinquency_30d_past_12m parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "loan_purpose",
+          "description": "The loan_purpose parameter for the model",
+          "type": "any"
+        }
+      ],
+      "result": {
+        "type": "any",
+        "dimensionality": "matrix"
+      },
+      "options": {
+        "stream": false,
+        "cancelable": false
+      }
+    },
+    {
+      "id": "GETEXPECTEDLOSSAPI",
+      "name": "DOMINO.ENDPOINTUDFS.GETEXPECTEDLOSSAPI",
+      "description": "Calls the GetExpectedLossApi Domino model API endpoint.",
+      "parameters": [
+        {
+          "name": "loan_id",
+          "description": "The loan_id parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "probability_of_default_1y",
+          "description": "The probability_of_default_1y parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "exposure_at_default",
+          "description": "The exposure_at_default parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "loss_given_default",
+          "description": "The loss_given_default parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "credit_rating",
+          "description": "The credit_rating parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "remaining_term_years",
+          "description": "The remaining_term_years parameter for the model",
+          "type": "any"
+        },
+        {
+          "name": "curve_tenors",
+          "description": "The curve_tenors parameter for the model",
+          "type": "any",
+          "dimensionality": "matrix"
+        },
+        {
+          "name": "curve_rates",
+          "description": "The curve_rates parameter for the model",
+          "type": "any",
+          "dimensionality": "matrix"
+        }
+      ],
+      "result": {
+        "type": "any",
+        "dimensionality": "matrix"
+      },
+      "options": {
+        "stream": false,
+        "cancelable": false
+      }
+    },
+    {
+      "id": "GETLOANINVENTORYAPI",
+      "name": "DOMINO.ENDPOINTUDFS.GETLOANINVENTORYAPI",
+      "description": "Calls the GetLoanInventoryApi Domino model API endpoint.",
+      "parameters": [
+        {
+          "name": "inventory_date",
+          "description": "The inventory_date parameter for the model",
+          "type": "any"
+        }
+      ],
+      "result": {
+        "type": "any",
+        "dimensionality": "matrix"
+      },
+      "options": {
+        "stream": false,
+        "cancelable": false
+      }
+    }
+  ]
+}
