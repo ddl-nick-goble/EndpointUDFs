@@ -1986,7 +1986,7 @@ def main():
 
     # Parse command-line arguments (from Domino Launcher checkboxes)
     parser = argparse.ArgumentParser(description="Domino Endpoint UDF Add-in Generator")
-    parser.add_argument("include_raw_genai", nargs="?", default="true",
+    parser.add_argument("include_raw_genai", nargs="?", default="false",
                         help="Include raw GenAI endpoint UDF (true/false)")
     parser.add_argument("include_narrate", nargs="?", default="true",
                         help="Include Narrate agent UDF (true/false)")
