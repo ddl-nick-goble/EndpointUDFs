@@ -1986,28 +1986,28 @@ def main():
 
     # Parse command-line arguments (from Domino Launcher checkboxes)
     parser = argparse.ArgumentParser(description="Domino Endpoint UDF Add-in Generator")
-    parser.add_argument("include_raw_genai", nargs="?", default="false",
+    parser.add_argument("include_raw_genai_udf", nargs="?", default="false",
                         help="Include raw GenAI endpoint UDF (true/false)")
-    parser.add_argument("include_narrate", nargs="?", default="true",
+    parser.add_argument("include_narrate_udf", nargs="?", default="true",
                         help="Include Narrate agent UDF (true/false)")
-    parser.add_argument("include_explain_delta", nargs="?", default="true",
+    parser.add_argument("include_explain_delta_udf", nargs="?", default="true",
                         help="Include ExplainDelta agent UDF (true/false)")
-    parser.add_argument("include_uncover", nargs="?", default="true",
+    parser.add_argument("include_uncover_udf", nargs="?", default="true",
                         help="Include Uncover agent UDF (true/false)")
-    parser.add_argument("include_speculate", nargs="?", default="true",
+    parser.add_argument("include_speculate_udf", nargs="?", default="true",
                         help="Include Speculate agent UDF (true/false)")
-    parser.add_argument("include_parrot", nargs="?", default="true",
+    parser.add_argument("include_parrot_udf", nargs="?", default="true",
                         help="Include Parrot agent UDF (true/false)")
     args = parser.parse_args()
 
-    include_raw_genai = _parse_bool(args.include_raw_genai)
+    include_raw_genai = _parse_bool(args.include_raw_genai_udf)
 
     enabled_agents = {
-        "narrate": _parse_bool(args.include_narrate),
-        "explain_delta": _parse_bool(args.include_explain_delta),
-        "uncover": _parse_bool(args.include_uncover),
-        "speculate": _parse_bool(args.include_speculate),
-        "parrot": _parse_bool(args.include_parrot),
+        "narrate": _parse_bool(args.include_narrate_udf),
+        "explain_delta": _parse_bool(args.include_explain_delta_udf),
+        "uncover": _parse_bool(args.include_uncover_udf),
+        "speculate": _parse_bool(args.include_speculate_udf),
+        "parrot": _parse_bool(args.include_parrot_udf),
     }
 
     print("=" * 60)
