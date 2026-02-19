@@ -1986,6 +1986,8 @@ def main():
 
     # Parse command-line arguments (from Domino Launcher checkboxes)
     parser = argparse.ArgumentParser(description="Domino Endpoint UDF Add-in Generator")
+    parser.add_argument("include_raw_genai", nargs="?", default="true",
+                        help="Include raw GenAI endpoint UDF (true/false)")
     parser.add_argument("include_narrate", nargs="?", default="true",
                         help="Include Narrate agent UDF (true/false)")
     parser.add_argument("include_explain_delta", nargs="?", default="true",
@@ -1997,6 +1999,8 @@ def main():
     parser.add_argument("include_parrot", nargs="?", default="true",
                         help="Include Parrot agent UDF (true/false)")
     args = parser.parse_args()
+
+    include_raw_genai = _parse_bool(args.include_raw_genai)
 
     enabled_agents = {
         "narrate": _parse_bool(args.include_narrate),
@@ -2069,6 +2073,12 @@ def main():
         if any(enabled_agents.values()):
             print()
             print("  Note: Agent UDFs requested but no GenAI endpoint found. Skipping agents.")
+
+    # Filter out raw GenAI UDFs if disabled (agents still use the discovered endpoint URL)
+    if not include_raw_genai and genai_endpoints:
+        print()
+        print("  Raw GenAI UDFs disabled — skipping direct endpoint functions.")
+        genai_endpoints = []
 
     if not endpoints and not genai_endpoints and not agent_configs:
         print()
