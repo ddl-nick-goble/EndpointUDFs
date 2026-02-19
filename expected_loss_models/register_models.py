@@ -19,15 +19,6 @@ from loan_inventory_model import LoanInventoryModel, build_loan_inventory
 from loan_pd_model import LoanPDModel
 from train_pd_model import train_and_save_pd_model
 
-RISK_WEIGHTS = {
-    "AAA": 0.20,
-    "AA": 0.20,
-    "A": 0.50,
-    "BBB": 1.00,
-    "BB": 1.50,
-    "B": 2.00,
-}
-
 BASE_DIR = os.path.dirname(__file__)
 CODE_PATHS = [
     os.path.join(BASE_DIR, "credit_curve_model.py"),
@@ -57,12 +48,13 @@ def _pd_examples(rng: np.random.Generator):
             "employment_years": rng.integers(1, 10, row_count).astype(float),
             "delinquency_30d_past_12m": rng.integers(0, 2, row_count).astype(float),
             "loan_purpose": rng.choice(["purchase", "refi"], row_count),
+            "tenor": rng.choice([1.0, 5.0, 10.0, 25.0], row_count),
         }
     )
     pd_output = pd.DataFrame(
         {
             "loan_id": pd_input["loan_id"].tolist(),
-            "probability_of_default_1y": rng.uniform(0.01, 0.1, row_count),
+            "probability_of_default": rng.uniform(0.01, 0.1, row_count),
         }
     )
     return pd_input, pd_output
@@ -75,24 +67,25 @@ def _el_examples(
     rng: np.random.Generator,
 ):
     row_count = len(pd_output)
-    ratings = rng.choice(["AAA", "AA", "A", "BBB", "BB"], row_count)
+    pd_1y_values = rng.uniform(0.001, 0.05, row_count)
     el_input = pd.DataFrame(
         {
             "loan_id": pd_output["loan_id"].tolist(),
-            "probability_of_default_1y": pd_output["probability_of_default_1y"]
-            .astype(float)
-            .tolist(),
+            "probability_of_default_1y": pd_1y_values,
+            "probability_of_default_5y": (
+                1.0 - (1.0 - pd_1y_values) ** 5
+            ),
+            "probability_of_default_maturity": rng.uniform(0.05, 0.5, row_count),
             "exposure_at_default": rng.integers(150000, 350000, row_count).astype(float),
-            "loss_given_default": rng.uniform(0.35, 0.55, row_count).astype(float),
-            "credit_rating": ratings,
             "remaining_term_years": rng.uniform(1.0, 6.0, row_count).astype(float),
             "curve_tenors": [curve_tenors] * row_count,
             "curve_rates": [curve_rates] * row_count,
         }
     )
+    lgd_approx = (0.25 + 0.5 * el_input["probability_of_default_maturity"]).clip(0.1, 0.75)
     el_undisc = (
-        el_input["probability_of_default_1y"]
-        * el_input["loss_given_default"]
+        el_input["probability_of_default_maturity"]
+        * lgd_approx
         * el_input["exposure_at_default"]
     ).round(2)
     el_disc = (el_undisc * 0.95).round(2)
@@ -100,6 +93,8 @@ def _el_examples(
     el_output = pd.DataFrame(
         {
             "loan_id": list(el_input["loan_id"]),
+            "implied_credit_rating": ["BBB"] * row_count,
+            "implied_lgd": list(lgd_approx.round(4)),
             "el_undiscounted": list(el_undisc),
             "el_discounted": list(el_disc),
             "rwa": list(rwa),
@@ -457,6 +452,7 @@ def register_models():
         "interest_rate",
         "employment_years",
         "delinquency_30d_past_12m",
+        "tenor",
     ]
     pd_input_example = _stringify_columns(pd_input, pd_numeric_cols)
     pd_signature = ModelSignature(
@@ -464,7 +460,7 @@ def register_models():
         outputs=Schema(
             [
                 ColSpec("string", name="loan_id"),
-                ColSpec("double", name="probability_of_default_1y"),
+                ColSpec("double", name="probability_of_default"),
             ]
         ),
     )
@@ -474,8 +470,9 @@ def register_models():
     el_input, el_output = _el_examples(pd_output, curve_tenors, curve_rates, rng)
     el_numeric_cols = [
         "probability_of_default_1y",
+        "probability_of_default_5y",
+        "probability_of_default_maturity",
         "exposure_at_default",
-        "loss_given_default",
         "remaining_term_years",
     ]
     el_input_example = _stringify_columns(el_input, el_numeric_cols)
@@ -484,9 +481,9 @@ def register_models():
             [
                 ColSpec("string", name="loan_id"),
                 ColSpec("string", name="probability_of_default_1y"),
+                ColSpec("string", name="probability_of_default_5y"),
+                ColSpec("string", name="probability_of_default_maturity"),
                 ColSpec("string", name="exposure_at_default"),
-                ColSpec("string", name="loss_given_default"),
-                ColSpec("string", name="credit_rating"),
                 ColSpec("string", name="remaining_term_years"),
                 ColSpec(Array("double"), name="curve_tenors"),
                 ColSpec(Array("double"), name="curve_rates"),
@@ -495,6 +492,8 @@ def register_models():
         outputs=Schema(
             [
                 ColSpec("string", name="loan_id"),
+                ColSpec("string", name="implied_credit_rating"),
+                ColSpec("double", name="implied_lgd"),
                 ColSpec("double", name="el_undiscounted"),
                 ColSpec("double", name="el_discounted"),
                 ColSpec("double", name="rwa"),
@@ -518,9 +517,7 @@ def register_models():
                 ColSpec("double", name="delinquency_30d_past_12m"),
                 ColSpec("string", name="loan_purpose"),
                 ColSpec("double", name="original_loan_term_years"),
-                ColSpec("string", name="credit_rating"),
                 ColSpec("double", name="remaining_term_years"),
-                ColSpec("double", name="loss_given_default"),
             ]
         ),
     )

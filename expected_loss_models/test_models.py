@@ -23,7 +23,7 @@ def run_smoke_test():
     if not model_path.exists():
         train_and_save_pd_model(str(model_path))
 
-    loans_in = pd.DataFrame(
+    loan_features = pd.DataFrame(
         {
             "loan_id": ["L001", "L002"],
             "credit_score": [720, 650],
@@ -37,18 +37,42 @@ def run_smoke_test():
             "loan_purpose": ["purchase", "refi"],
         }
     )
+
     pd_model = LoanPDModel()
     pd_model.load_context(_DummyContext({"xgb_model": str(model_path)}))
-    pd_out = pd_model.predict(None, loans_in)
 
-    el_in = loans_in.copy()
-    el_in["probability_of_default_1y"] = pd_out["probability_of_default_1y"]
-    el_in["exposure_at_default"] = [235000, 168000]
-    el_in["loss_given_default"] = [0.40, 0.45]
-    el_in["credit_rating"] = ["A", "BBB"]
-    el_in["remaining_term_years"] = [4.5, 2.0]
-    el_in["curve_tenors"] = [curve_tenors] * len(el_in)
-    el_in["curve_rates"] = [curve_rates] * len(el_in)
+    # Get 1Y PD
+    loans_1y = loan_features.copy()
+    loans_1y["tenor"] = 1.0
+    pd_out_1y = pd_model.predict(None, loans_1y)
+
+    # Get 5Y PD
+    loans_5y = loan_features.copy()
+    loans_5y["tenor"] = 5.0
+    pd_out_5y = pd_model.predict(None, loans_5y)
+
+    # Get maturity PD
+    remaining_terms = [4.5, 2.0]
+    loans_mat = loan_features.copy()
+    loans_mat["tenor"] = remaining_terms
+    pd_out_mat = pd_model.predict(None, loans_mat)
+
+    print("PD at 1Y:", pd_out_1y["probability_of_default"].tolist())
+    print("PD at 5Y:", pd_out_5y["probability_of_default"].tolist())
+    print("PD at maturity:", pd_out_mat["probability_of_default"].tolist())
+
+    el_in = pd.DataFrame(
+        {
+            "loan_id": ["L001", "L002"],
+            "probability_of_default_1y": pd_out_1y["probability_of_default"].values,
+            "probability_of_default_5y": pd_out_5y["probability_of_default"].values,
+            "probability_of_default_maturity": pd_out_mat["probability_of_default"].values,
+            "exposure_at_default": [235000, 168000],
+            "remaining_term_years": remaining_terms,
+            "curve_tenors": [curve_tenors] * 2,
+            "curve_rates": [curve_rates] * 2,
+        }
+    )
 
     el_out = ExpectedLossModel().predict(None, el_in)
     print(el_out)

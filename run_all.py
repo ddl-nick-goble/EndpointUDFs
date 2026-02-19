@@ -899,7 +899,7 @@ def generate_agent_udf_method(agent: AgentUDFConfig, project_name: str) -> str:
     # Build JSON payload construction as C# code.
     # Extends the GenAI pattern with system message + temperature + max_tokens.
     json_construction = (
-        '"{\\\"messages\\\": ['
+        '"{\\\"model\\\": \\\"\\\", \\\"messages\\\": ['
         '{\\\"role\\\": \\\"system\\\", \\\"content\\\": \\\"" + escapedSystem + "\\\"}, '
         '{\\\"role\\\": \\\"user\\\", \\\"content\\\": \\\"" + escapedPrompt + "\\\"}'
         '], '

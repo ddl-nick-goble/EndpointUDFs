@@ -16,6 +16,7 @@ REQUIRED_COLS = [
     "employment_years",
     "delinquency_30d_past_12m",
     "loan_purpose",
+    "tenor",
 ]
 
 INPUT_ALIASES = {
@@ -25,6 +26,8 @@ INPUT_ALIASES = {
     "original_balance": "original_principal_balance",
     "employment_length_years": "employment_years",
     "delinquency_30d_12m": "delinquency_30d_past_12m",
+    "tenor_years": "tenor",
+    "pd_tenor": "tenor",
 }
 
 FEATURE_NAME_MAP = {
@@ -106,11 +109,22 @@ class LoanPDModel(mlflow.pyfunc.PythonModel):
         )
 
     def predict(self, context, model_input: pd.DataFrame) -> pd.DataFrame:
+        model_input = _apply_aliases(model_input)
+        _ensure_columns(model_input, REQUIRED_COLS)
+
+        tenors = pd.to_numeric(model_input["tenor"], errors="coerce").values
+        if (tenors[np.isfinite(tenors)] < 0).any():
+            raise ValueError("tenor must be non-negative")
+
         features = self._extract_features(model_input)
-        pds = self.model.predict_proba(features)[:, 1]
+        pds_1y = self.model.predict_proba(features)[:, 1]
+
+        # Scale 1Y PD to requested tenor: PD(t) = 1 - (1 - PD_1y)^t
+        pds = 1.0 - (1.0 - pds_1y) ** tenors
+
         return pd.DataFrame(
             {
                 "loan_id": model_input["loan_id"].astype(str).values,
-                "probability_of_default_1y": pds,
+                "probability_of_default": pds,
             }
         )

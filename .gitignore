@@ -1,5 +1,21 @@
-__pycache__/
+# Python
+**/__pycache__/
+**/*.py[cod]
+
+# Model artifacts
+pd_model.json
+expected_loss_models/pd_model.json
+
+# Claude
 .claude/
+
+# Excel Add-in binaries
+*.xll
+
+# Optional build outputs
+bin/
+obj/
+
 DominoModelFunctions-AddIn64.xll
 DominoModelFunctions-AddIn.xll
 DominoModelFunctions.cs

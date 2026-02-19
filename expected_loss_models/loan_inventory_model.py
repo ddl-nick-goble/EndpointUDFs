@@ -1,28 +1,7 @@
 from __future__ import annotations
 
-from typing import List
-
 import mlflow.pyfunc
 import pandas as pd
-
-
-def _lgd_from_rating(credit_rating: str, original_loan_term_years: float) -> float:
-    mapping = {
-        "AAA": 0.30,
-        "AA": 0.32,
-        "A": 0.36,
-        "BBB": 0.45,
-        "BB": 0.52,
-        "B": 0.62,
-    }
-    base = mapping.get(credit_rating, 0.45)
-    if original_loan_term_years <= 5:
-        adj = -0.02
-    elif original_loan_term_years > 15:
-        adj = 0.03
-    else:
-        adj = 0.0
-    return max(0.1, min(0.75, base + adj))
 
 
 def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
@@ -40,9 +19,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 0,
             "loan_purpose": "purchase",
             "original_loan_term_years": 30,
-            "credit_rating": "AAA",
             "remaining_term_years": 29,
-            "loss_given_default": _lgd_from_rating("AAA", 30),
         },
         {
             "loan_id": "L002",
@@ -56,9 +33,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 0,
             "loan_purpose": "refi",
             "original_loan_term_years": 30,
-            "credit_rating": "AA",
             "remaining_term_years": 28,
-            "loss_given_default": _lgd_from_rating("AA", 30),
         },
         {
             "loan_id": "L003",
@@ -72,9 +47,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 0,
             "loan_purpose": "purchase",
             "original_loan_term_years": 25,
-            "credit_rating": "A",
             "remaining_term_years": 22,
-            "loss_given_default": _lgd_from_rating("A", 25),
         },
         {
             "loan_id": "L004",
@@ -88,9 +61,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 1,
             "loan_purpose": "refi",
             "original_loan_term_years": 20,
-            "credit_rating": "BBB",
             "remaining_term_years": 16,
-            "loss_given_default": _lgd_from_rating("BBB", 20),
         },
         {
             "loan_id": "L005",
@@ -104,9 +75,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 1,
             "loan_purpose": "purchase",
             "original_loan_term_years": 20,
-            "credit_rating": "BBB",
             "remaining_term_years": 15,
-            "loss_given_default": _lgd_from_rating("BBB", 20),
         },
         {
             "loan_id": "L006",
@@ -120,9 +89,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 2,
             "loan_purpose": "refi",
             "original_loan_term_years": 15,
-            "credit_rating": "BB",
             "remaining_term_years": 9,
-            "loss_given_default": _lgd_from_rating("BB", 15),
         },
         {
             "loan_id": "L007",
@@ -136,9 +103,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 2,
             "loan_purpose": "purchase",
             "original_loan_term_years": 15,
-            "credit_rating": "B",
             "remaining_term_years": 8,
-            "loss_given_default": _lgd_from_rating("B", 15),
         },
         {
             "loan_id": "L008",
@@ -152,9 +117,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 0,
             "loan_purpose": "purchase",
             "original_loan_term_years": 30,
-            "credit_rating": "A",
             "remaining_term_years": 28,
-            "loss_given_default": _lgd_from_rating("A", 30),
         },
         {
             "loan_id": "L009",
@@ -168,9 +131,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 0,
             "loan_purpose": "refi",
             "original_loan_term_years": 25,
-            "credit_rating": "BBB",
             "remaining_term_years": 22,
-            "loss_given_default": _lgd_from_rating("BBB", 25),
         },
         {
             "loan_id": "L010",
@@ -184,9 +145,7 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
             "delinquency_30d_past_12m": 1,
             "loan_purpose": "purchase",
             "original_loan_term_years": 20,
-            "credit_rating": "BB",
             "remaining_term_years": 14,
-            "loss_given_default": _lgd_from_rating("BB", 20),
         },
     ]
     inventory = pd.DataFrame(rows)
@@ -201,10 +160,8 @@ def build_loan_inventory(inventory_date: str) -> pd.DataFrame:
         "employment_years",
         "delinquency_30d_past_12m",
         "loan_purpose",
-        "credit_rating",
         "original_loan_term_years",
         "remaining_term_years",
-        "loss_given_default",
     ]
     return inventory[ordered_cols]
 

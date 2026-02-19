@@ -11,9 +11,9 @@ from credit_curve_model import RATINGS, _spreads
 REQUIRED_COLS = [
     "loan_id",
     "probability_of_default_1y",
+    "probability_of_default_5y",
+    "probability_of_default_maturity",
     "exposure_at_default",
-    "loss_given_default",
-    "credit_rating",
     "remaining_term_years",
     "curve_tenors",
     "curve_rates",
@@ -21,9 +21,9 @@ REQUIRED_COLS = [
 
 INPUT_ALIASES = {
     "pd_1y": "probability_of_default_1y",
+    "pd_5y": "probability_of_default_5y",
+    "pd_maturity": "probability_of_default_maturity",
     "ead": "exposure_at_default",
-    "lgd": "loss_given_default",
-    "rating": "credit_rating",
     "years_to_maturity": "remaining_term_years",
 }
 
@@ -35,6 +35,38 @@ RISK_WEIGHTS = {
     "BB": 1.50,
     "B": 2.00,
 }
+
+PD_RATING_THRESHOLDS = [
+    (0.0004, "AAA"),
+    (0.001, "AA"),
+    (0.002, "A"),
+    (0.005, "BBB"),
+    (0.02, "BB"),
+]
+
+
+def _derive_credit_rating(pd_1y: float) -> str:
+    """Map 1-year PD to an implied credit rating."""
+    for threshold, rating in PD_RATING_THRESHOLDS:
+        if pd_1y < threshold:
+            return rating
+    return "B"
+
+
+def _derive_lgd(pd_1y: float, pd_5y: float, pd_maturity: float) -> float:
+    """Derive implied LGD from PD term structure.
+
+    Base component from maturity PD level; steepness adjustment
+    from the 5Y/1Y PD ratio.
+    """
+    base_lgd = 0.25 + 0.5 * pd_maturity
+    if pd_1y > 1e-6:
+        steepness_ratio = pd_5y / pd_1y
+        steepness_adj = 0.02 * max(0.0, steepness_ratio - 4.0)
+    else:
+        steepness_adj = 0.0
+    lgd = base_lgd + steepness_adj
+    return max(0.10, min(0.75, lgd))
 
 
 def _ensure_columns(model_input: pd.DataFrame, columns: List[str]) -> None:
@@ -77,15 +109,20 @@ def get_risky_discount_factor(
     return float(np.exp(-risky_rate * years))
 
 
-def compute_expected_loss(row: pd.Series, curve_df: pd.DataFrame) -> Tuple[float, float, float]:
-    el_undisc = (
-        row["probability_of_default_1y"]
-        * row["loss_given_default"]
-        * row["exposure_at_default"]
-    )
-    df = get_risky_discount_factor(curve_df, row["credit_rating"], row["remaining_term_years"])
+def compute_expected_loss(
+    row: pd.Series,
+    curve_df: pd.DataFrame,
+    implied_rating: str,
+    implied_lgd: float,
+) -> Tuple[float, float, float]:
+    pd_maturity = row["probability_of_default_maturity"]
+    ead = row["exposure_at_default"]
+    remaining_years = row["remaining_term_years"]
+
+    el_undisc = pd_maturity * implied_lgd * ead
+    df = get_risky_discount_factor(curve_df, implied_rating, remaining_years)
     el_disc = el_undisc * df
-    rwa = row["exposure_at_default"] * RISK_WEIGHTS.get(row["credit_rating"], 1.0)
+    rwa = ead * RISK_WEIGHTS.get(implied_rating, 1.0)
     if not np.isfinite([el_undisc, el_disc, rwa]).all():
         raise ValueError("Computed values contain NaN or Inf")
     return float(el_undisc), float(el_disc), float(rwa)
@@ -131,8 +168,9 @@ class ExpectedLossModel(mlflow.pyfunc.PythonModel):
             model_input,
             [
                 "probability_of_default_1y",
+                "probability_of_default_5y",
+                "probability_of_default_maturity",
                 "exposure_at_default",
-                "loss_given_default",
                 "remaining_term_years",
             ],
         )
@@ -144,12 +182,19 @@ class ExpectedLossModel(mlflow.pyfunc.PythonModel):
 
         results = []
         for _, row in model_input.iterrows():
-            print(f"[ExpectedLossModel] Row loan_id={row['loan_id']} rating={row['credit_rating']} term={row['remaining_term_years']}")
-            el_u, el_d, rwa = compute_expected_loss(row, curve_df)
-            risk_weight = RISK_WEIGHTS.get(row["credit_rating"], 1.0)
+            implied_rating = _derive_credit_rating(row["probability_of_default_1y"])
+            implied_lgd = _derive_lgd(
+                row["probability_of_default_1y"],
+                row["probability_of_default_5y"],
+                row["probability_of_default_maturity"],
+            )
+            print(f"[ExpectedLossModel] Row loan_id={row['loan_id']} implied_rating={implied_rating} implied_lgd={implied_lgd:.4f} term={row['remaining_term_years']}")
+            el_u, el_d, rwa = compute_expected_loss(row, curve_df, implied_rating, implied_lgd)
             results.append(
                 {
                     "loan_id": row["loan_id"],
+                    "implied_credit_rating": implied_rating,
+                    "implied_lgd": round(implied_lgd, 4),
                     "el_undiscounted": el_u,
                     "el_discounted": el_d,
                     "rwa": rwa,
