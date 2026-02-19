@@ -12,6 +12,7 @@ Each discovered endpoint is converted into a strongly-typed UDF with full docume
 parameter descriptions, and error handling.
 """
 
+import argparse
 import base64
 import html
 import json
@@ -31,6 +32,83 @@ API_KEY = os.environ.get("DOMINO_USER_API_KEY", "")
 PROJECT_ID = os.environ.get("DOMINO_PROJECT_ID", "")
 PROJECT_NAME = os.environ.get("DOMINO_PROJECT_NAME", "")
 
+# Agent definitions: each agent wraps a GenAI endpoint with a custom system prompt
+AGENTS = {
+    "narrate": {
+        "function_name": "Narrate",
+        "display_name": "Narrate",
+        "system": (
+            "You are a financial narrator. Given structured data (tables, numbers, metrics), "
+            "write clear, professional prose explaining what the data shows. "
+            "Do not speculate about the future. Do not flag errors. Just tell the story of what's in front of you. "
+            "Write for an informed reader — no need to define basic financial terms. "
+            "Be concise. One to three paragraphs max unless the data is very complex. "
+            "Always ground every claim in specific numbers from the input."
+        ),
+        "temperature": 0.3,
+        "max_tokens": 1024,
+    },
+    "explain_delta": {
+        "function_name": "ExplainDelta",
+        "display_name": "ExplainDelta",
+        "system": (
+            "You are a change analyst. You will receive two data snapshots or a time series. "
+            "Your job is to explain what changed, quantify the magnitude, identify the primary drivers, "
+            "and distinguish material movements from noise. "
+            "Structure your response as: (1) headline change, (2) primary drivers, (3) what didn't move that you'd expect to. "
+            "Be specific with numbers. Never speculate on future direction — only explain what already happened. "
+            "If the changes are immaterial, say so directly."
+        ),
+        "temperature": 0.2,
+        "max_tokens": 1024,
+    },
+    "uncover": {
+        "function_name": "Uncover",
+        "display_name": "Uncover",
+        "system": (
+            "You are a pattern and correlation analyst. Given a dataset, surface non-obvious relationships, "
+            "correlations, clusters, lags, seasonality, or structural patterns. "
+            "Prioritize findings that would surprise the user — they can already see the obvious. "
+            "For each pattern you identify, state: (1) what the pattern is, (2) how strong/consistent it appears, "
+            "(3) a plausible mechanism or explanation, (4) whether it's actionable or just interesting. "
+            "Be honest about confidence. Say 'this might be noise' when it might be noise. "
+            "Do not narrate or summarize the data — only surface hidden structure."
+        ),
+        "temperature": 0.5,
+        "max_tokens": 1500,
+    },
+    "speculate": {
+        "function_name": "Speculate",
+        "display_name": "Speculate",
+        "system": (
+            "You are a forward-looking scenario analyst. Given data and optionally a scenario prompt, "
+            "reason about what could happen next. Identify plausible trajectories, second-order effects, "
+            "tail risks, and inflection points. "
+            "Always present at least two alternative paths — never a single prediction. "
+            "For each path, state the conditions that would make it more or less likely. "
+            "Be explicit that these are informed hypotheses, not forecasts. "
+            "Ground your reasoning in the data provided — do not invent facts. "
+            "If the user provides a specific scenario (e.g. 'rates +200bps'), focus your analysis on that scenario's implications."
+        ),
+        "temperature": 0.7,
+        "max_tokens": 1500,
+    },
+    "parrot": {
+        "function_name": "Parrot",
+        "display_name": "Parrot",
+        "system": (
+            "You are a pirate financial analyst. Read the data provided and explain what it shows, "
+            "but do so entirely in pirate voice. Use nautical metaphors for financial concepts. "
+            "Interest rates are 'the tides.' Portfolios are 'the fleet.' Losses are 'taking on water.' "
+            "Gains are 'plunder.' Risk is 'stormy seas.' The CEO is 'the captain.' "
+            "Be genuinely insightful about the data — the pirate voice is the delivery, not the substance. "
+            "Start every response with 'Ahoy!' and end with a pirate-appropriate sign-off."
+        ),
+        "temperature": 0.8,
+        "max_tokens": 1024,
+    },
+}
+
 
 @dataclass
 class EndpointConfig:
@@ -44,6 +122,26 @@ class EndpointConfig:
     return_description: str
 
 
+@dataclass
+class GenAIEndpointConfig:
+    """Configuration for a gen-AI (OpenAI-compatible) endpoint to be converted to a UDF."""
+    name: str
+    base_url: str  # e.g., "https://apps.se-demo.domino.tech/endpoints/{id}/v1"
+    description: str
+
+
+@dataclass
+class AgentUDFConfig:
+    """Configuration for an agent UDF layered on top of a GenAI endpoint."""
+    function_name: str       # C# method name, e.g., "Narrate"
+    display_name: str        # Human-readable name for logging
+    system_prompt: str       # System message for the chat completions API
+    temperature: float       # Temperature parameter
+    max_tokens: int          # Max tokens parameter
+    base_url: str            # The GenAI endpoint base URL
+    description: str         # Description for the Excel function tooltip
+
+
 # =============================================================================
 # Endpoint Discovery Functions (from claude_create_curls.py)
 # =============================================================================
@@ -55,6 +153,58 @@ def get_models(project_id: str) -> list:
     resp = requests.get(url, params={"projectId": project_id}, headers=headers, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def discover_genai_endpoints(project_id: str, project_name: str) -> list[GenAIEndpointConfig]:
+    """
+    Discover gen-AI (OpenAI-compatible) endpoints from Domino App Endpoints.
+
+    Queries /v4/modelProducts for running apps whose openUrl matches
+    the /endpoints/{uuid}/ pattern, then builds GenAIEndpointConfig objects.
+    """
+    genai_endpoints = []
+
+    # Build the apps domain: https://se-demo.domino.tech:443 -> https://apps.se-demo.domino.tech
+    from urllib.parse import urlparse
+    parsed = urlparse(DOMINO_URL)
+    apps_base = f"{parsed.scheme}://apps.{parsed.hostname}"
+
+    url = f"{DOMINO_URL}/v4/modelProducts"
+    headers = {"X-Domino-Api-Key": API_KEY}
+    try:
+        resp = requests.get(url, params={"projectId": project_id}, headers=headers, timeout=30)
+        resp.raise_for_status()
+        products = resp.json()
+    except Exception as e:
+        print(f"  (could not query app endpoints: {e})")
+        return []
+
+    for product in products:
+        open_url = product.get("openUrl", "")
+        status = product.get("status", "")
+        name = product.get("name", "UnnamedEndpoint")
+
+        # Only running apps with /endpoints/{uuid}/ URL pattern
+        if status != "Running":
+            continue
+        match = re.match(r'^/endpoints/([0-9a-f-]{36})/', open_url)
+        if not match:
+            continue
+
+        endpoint_uuid = match.group(1)
+        base_url = f"{apps_base}/endpoints/{endpoint_uuid}/v1"
+        function_name = clean_function_name(name)
+
+        genai_ep = GenAIEndpointConfig(
+            name=function_name,
+            base_url=base_url,
+            description=f"Calls the {name} Domino GenAI endpoint.",
+        )
+        genai_endpoints.append(genai_ep)
+        excel_name = f"Domino.{project_name}.{function_name}" if project_name else f"Domino.{function_name}"
+        print(f"    Found GenAI: {excel_name}(prompt, additional_context)")
+
+    return genai_endpoints
 
 
 def _load_input_example(local_dir: str) -> dict | None:
@@ -232,6 +382,16 @@ def extract_help_topic_url(endpoint_url: str, domino_base_url: str) -> str:
     return f"{base_url}/models/{model_id}/overview?ownerName=nick_goble&projectName=EndpointUDFs"
 
 
+def _is_genai_url(url: str) -> bool:
+    """Detect if a URL is a gen-AI endpoint (OpenAI-compatible /endpoints/{uuid}/v1 pattern)."""
+    return bool(re.search(r'/endpoints/[0-9a-f-]{36}/v\d+', url, re.I))
+
+
+def _genai_base_url(url: str) -> str:
+    """Extract the base URL for a gen-AI endpoint (strip /chat/completions if present)."""
+    return re.sub(r'/chat/completions/?$', '', url).rstrip('/')
+
+
 def _split_param_tokens(name: str) -> list[str]:
     """Split a parameter name into lowercase tokens for heuristics."""
     if not name:
@@ -386,11 +546,13 @@ def get_project_name(project_id: str) -> str:
     return ""
 
 
-def discover_endpoints(project_id: str, project_name: str) -> list[EndpointConfig]:
+def discover_endpoints(project_id: str, project_name: str) -> tuple[list[EndpointConfig], list[GenAIEndpointConfig]]:
     """
     Discover all model endpoints in a project and build EndpointConfig objects.
+    Returns (regular_endpoints, genai_endpoints).
     """
     endpoints = []
+    genai_endpoints = []
     models = get_models(project_id)
 
     for model in models:
@@ -413,7 +575,25 @@ def discover_endpoints(project_id: str, project_name: str) -> list[EndpointConfi
 
         # Parse the curl command
         curl_info = parse_curl_command(curl_text)
-        if not curl_info or 'username' not in curl_info or 'password' not in curl_info:
+        if not curl_info:
+            print(f"    (skipped - could not parse curl)")
+            continue
+
+        # Check if this is a gen-AI endpoint (OpenAI-compatible)
+        if _is_genai_url(curl_info.get('url', '')):
+            function_name = clean_function_name(name)
+            base_url = _genai_base_url(curl_info['url'])
+            genai_ep = GenAIEndpointConfig(
+                name=function_name,
+                base_url=base_url,
+                description=f"Calls the {name} Domino GenAI endpoint.",
+            )
+            genai_endpoints.append(genai_ep)
+            excel_name = f"Domino.{project_name}.{function_name}" if project_name else f"Domino.{function_name}"
+            print(f"    Found GenAI: {excel_name}(prompt, additional_context)")
+            continue
+
+        if 'username' not in curl_info or 'password' not in curl_info:
             print(f"    (skipped - could not parse curl)")
             continue
 
@@ -497,7 +677,7 @@ def discover_endpoints(project_id: str, project_name: str) -> list[EndpointConfi
         excel_function_name = f"Domino.{project_name}.{function_name}" if project_name else f"Domino.{function_name}"
         print(f"    Found: {excel_function_name}({param_names})")
 
-    return endpoints
+    return endpoints, genai_endpoints
 
 
 # =============================================================================
@@ -617,17 +797,214 @@ def generate_udf_method(endpoint: EndpointConfig, project_name: str) -> str:
     return method
 
 
-def generate_csharp_code(endpoints: list[EndpointConfig], project_name: str) -> str:
+def generate_genai_udf_method(endpoint: GenAIEndpointConfig, project_name: str) -> str:
+    """Generate a C# UDF method for a gen-AI endpoint."""
+
+    escaped_description = endpoint.description.replace('"', '\\"')
+
+    if project_name:
+        excel_function_name = f"Domino.{project_name}.{endpoint.name}"
+    else:
+        excel_function_name = f"Domino.{endpoint.name}"
+
+    # Build the JSON payload construction as C# code
+    # Target C#: "{\"messages\": [{\"role\": \"user\", \"content\": \"" + escapedPrompt + "\"}]}"
+    json_construction = '"{\\\"messages\\\": [{\\\"role\\\": \\\"user\\\", \\\"content\\\": \\\"" + escapedPrompt + "\\\"}]}"'
+
+    method = f'''
+        /// <summary>
+        /// {endpoint.description}
+        /// </summary>
+        /// <returns>Returns the AI-generated response as a single string</returns>
+        [ExcelFunction(
+            Name = "{excel_function_name}",
+            Description = "{escaped_description}",
+            Category = "Domino GenAI APIs",
+            IsVolatile = false,
+            IsExceptionSafe = true,
+            IsThreadSafe = true
+        )]
+        public static object {endpoint.name}(
+            [ExcelArgument(Name = "prompt", Description = "The prompt to send to the AI endpoint")] object prompt,
+            [ExcelArgument(Name = "additional_context", Description = "Additional context data (array of any type, optional)", AllowReference = true)] object additional_context)
+        {{
+            try
+            {{
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+
+                string apiKey = GetApiKey();
+                if (string.IsNullOrEmpty(apiKey))
+                    return "Error: No Domino API key. Set DOMINO_USER_API_KEY env var or place domino_config.json next to the .xll";
+
+                object normalizedPrompt = NormalizeExcelValue(prompt);
+                if (normalizedPrompt == null || normalizedPrompt is ExcelMissing || normalizedPrompt is ExcelEmpty)
+                    return "Enter a prompt to call the GenAI endpoint";
+                string promptText = Convert.ToString(normalizedPrompt, CultureInfo.InvariantCulture);
+                if (string.IsNullOrWhiteSpace(promptText))
+                    return "Enter a prompt to call the GenAI endpoint";
+                string contextText = SerializeAdditionalContext(additional_context);
+                string actualPrompt = promptText;
+                if (!string.IsNullOrEmpty(contextText))
+                {{
+                    actualPrompt += "  The user added additional context: " + contextText;
+                }}
+
+                string url = "{endpoint.base_url}/chat/completions";
+                string escapedPrompt = EscapeJsonString(actualPrompt);
+                string jsonPayload = {json_construction};
+
+                using (var client = new WebClient())
+                {{
+                    client.Headers[HttpRequestHeader.ContentType] = "application/json";
+                    client.Headers["X-Domino-Api-Key"] = apiKey;
+
+                    string response = client.UploadString(url, "POST", jsonPayload);
+                    return ParseGenAIResult(response);
+                }}
+            }}
+            catch (WebException ex)
+            {{
+                if (ex.Response != null)
+                {{
+                    using (var reader = new StreamReader(ex.Response.GetResponseStream()))
+                    {{
+                        return "API Error: " + reader.ReadToEnd();
+                    }}
+                }}
+                return "Error: " + ex.Message;
+            }}
+            catch (Exception ex)
+            {{
+                return "Error: " + ex.Message;
+            }}
+        }}
+'''
+    return method
+
+
+def generate_agent_udf_method(agent: AgentUDFConfig, project_name: str) -> str:
+    """Generate a C# UDF method for an agent endpoint."""
+
+    escaped_description = agent.description.replace('"', '\\"')
+
+    if project_name:
+        excel_function_name = f"Domino.{project_name}.{agent.function_name}"
+    else:
+        excel_function_name = f"Domino.{agent.function_name}"
+
+    # Escape the system prompt for embedding in a C# string literal.
+    # At runtime, EscapeJsonString() will handle JSON escaping.
+    cs_system_prompt = agent.system_prompt.replace('\\', '\\\\').replace('"', '\\"')
+
+    # Build JSON payload construction as C# code.
+    # Extends the GenAI pattern with system message + temperature + max_tokens.
+    json_construction = (
+        '"{\\\"messages\\\": ['
+        '{\\\"role\\\": \\\"system\\\", \\\"content\\\": \\\"" + escapedSystem + "\\\"}, '
+        '{\\\"role\\\": \\\"user\\\", \\\"content\\\": \\\"" + escapedPrompt + "\\\"}'
+        '], '
+        f'\\\"temperature\\\": {agent.temperature}, '
+        f'\\\"max_tokens\\\": {agent.max_tokens}'
+        '}"'
+    )
+
+    method = f'''
+        /// <summary>
+        /// {agent.description}
+        /// </summary>
+        /// <returns>Returns the AI-generated response as a single string</returns>
+        [ExcelFunction(
+            Name = "{excel_function_name}",
+            Description = "{escaped_description}",
+            Category = "Domino AI Agents",
+            IsVolatile = false,
+            IsExceptionSafe = true,
+            IsThreadSafe = true
+        )]
+        public static object {agent.function_name}(
+            [ExcelArgument(Name = "prompt", Description = "The prompt to send to the {agent.display_name} agent")] object prompt,
+            [ExcelArgument(Name = "additional_context", Description = "Additional context data (array of any type, optional)", AllowReference = true)] object additional_context)
+        {{
+            try
+            {{
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+
+                string apiKey = GetApiKey();
+                if (string.IsNullOrEmpty(apiKey))
+                    return "Error: No Domino API key. Set DOMINO_USER_API_KEY env var or place domino_config.json next to the .xll";
+
+                object normalizedPrompt = NormalizeExcelValue(prompt);
+                if (normalizedPrompt == null || normalizedPrompt is ExcelMissing || normalizedPrompt is ExcelEmpty)
+                    return "Enter a prompt to call the {agent.display_name} agent";
+                string promptText = Convert.ToString(normalizedPrompt, CultureInfo.InvariantCulture);
+                if (string.IsNullOrWhiteSpace(promptText))
+                    return "Enter a prompt to call the {agent.display_name} agent";
+                string contextText = SerializeAdditionalContext(additional_context);
+                string actualPrompt = promptText;
+                if (!string.IsNullOrEmpty(contextText))
+                {{
+                    actualPrompt += "  The user added additional context: " + contextText;
+                }}
+
+                string url = "{agent.base_url}/chat/completions";
+                string escapedPrompt = EscapeJsonString(actualPrompt);
+                string systemPrompt = "{cs_system_prompt}";
+                string escapedSystem = EscapeJsonString(systemPrompt);
+                string jsonPayload = {json_construction};
+
+                using (var client = new WebClient())
+                {{
+                    client.Headers[HttpRequestHeader.ContentType] = "application/json";
+                    client.Headers["X-Domino-Api-Key"] = apiKey;
+
+                    string response = client.UploadString(url, "POST", jsonPayload);
+                    return ParseGenAIResult(response);
+                }}
+            }}
+            catch (WebException ex)
+            {{
+                if (ex.Response != null)
+                {{
+                    using (var reader = new StreamReader(ex.Response.GetResponseStream()))
+                    {{
+                        return "API Error: " + reader.ReadToEnd();
+                    }}
+                }}
+                return "Error: " + ex.Message;
+            }}
+            catch (Exception ex)
+            {{
+                return "Error: " + ex.Message;
+            }}
+        }}
+'''
+    return method
+
+
+def generate_csharp_code(endpoints: list[EndpointConfig], project_name: str,
+                         genai_endpoints: list[GenAIEndpointConfig] | None = None,
+                         agent_configs: list[AgentUDFConfig] | None = None) -> str:
     """Generate the complete C# add-in code."""
 
+    genai_endpoints = genai_endpoints or []
+    agent_configs = agent_configs or []
+
     methods = "\n".join([generate_udf_method(ep, project_name) for ep in endpoints])
+    genai_methods = "\n".join([generate_genai_udf_method(ep, project_name) for ep in genai_endpoints])
+    agent_methods = "\n".join([generate_agent_udf_method(agent, project_name) for agent in agent_configs])
 
     # Build function documentation
-    func_docs = "\n".join([
-        f"/// - Domino.{project_name}.{ep.name}: {ep.description[:60]}..."
-        if project_name else f"/// - Domino.{ep.name}: {ep.description[:60]}..."
-        for ep in endpoints
-    ])
+    func_docs_parts = []
+    for ep in endpoints:
+        prefix = f"Domino.{project_name}.{ep.name}" if project_name else f"Domino.{ep.name}"
+        func_docs_parts.append(f"/// - {prefix}: {ep.description[:60]}...")
+    for ep in genai_endpoints:
+        prefix = f"Domino.{project_name}.{ep.name}" if project_name else f"Domino.{ep.name}"
+        func_docs_parts.append(f"/// - {prefix}: {ep.description[:60]}...")
+    for agent in agent_configs:
+        prefix = f"Domino.{project_name}.{agent.function_name}" if project_name else f"Domino.{agent.function_name}"
+        func_docs_parts.append(f"/// - {prefix}: {agent.description[:60]}...")
+    func_docs = "\n".join(func_docs_parts)
 
     code = f'''using System;
 using System.Collections.Generic;
@@ -655,6 +1032,172 @@ public static class DominoModelFunctions
         Number,
         Bool,
         Date,
+    }}
+
+    private static string _cachedApiKey = null;
+
+    /// <summary>
+    /// Reads the Domino API key from environment variable or config file.
+    /// Checks DOMINO_USER_API_KEY first, then DOMINO_API_KEY, then domino_config.json.
+    /// </summary>
+    private static string GetApiKey()
+    {{
+        if (_cachedApiKey != null) return _cachedApiKey;
+
+        string envKey = Environment.GetEnvironmentVariable("DOMINO_USER_API_KEY");
+        if (!string.IsNullOrEmpty(envKey))
+        {{
+            _cachedApiKey = envKey;
+            return _cachedApiKey;
+        }}
+
+        envKey = Environment.GetEnvironmentVariable("DOMINO_API_KEY");
+        if (!string.IsNullOrEmpty(envKey))
+        {{
+            _cachedApiKey = envKey;
+            return _cachedApiKey;
+        }}
+
+        try
+        {{
+            string xllDir = Path.GetDirectoryName(ExcelDnaUtil.XllPath);
+            string configPath = Path.Combine(xllDir, "domino_config.json");
+            if (File.Exists(configPath))
+            {{
+                string json = File.ReadAllText(configPath);
+                var match = Regex.Match(json, @"""api_key""\s*:\s*""([^""]+)""");
+                if (match.Success)
+                {{
+                    _cachedApiKey = match.Groups[1].Value;
+                    return _cachedApiKey;
+                }}
+            }}
+        }}
+        catch
+        {{
+            // Ignore file read errors
+        }}
+
+        return null;
+    }}
+
+    /// <summary>
+    /// Serializes the additional_context parameter to a string for appending to prompts.
+    /// Handles single values, 1D arrays, and 2D Excel ranges.
+    /// </summary>
+    private static string SerializeAdditionalContext(object value)
+    {{
+        value = NormalizeExcelValue(value);
+        if (value == null || value is ExcelMissing || value is ExcelEmpty)
+        {{
+            return "";
+        }}
+
+        if (value is Array array)
+        {{
+            var sb = new StringBuilder();
+            sb.Append('[');
+            bool first = true;
+
+            if (array.Rank == 1)
+            {{
+                for (int i = array.GetLowerBound(0); i <= array.GetUpperBound(0); i++)
+                {{
+                    object item = array.GetValue(i);
+                    if (IsEmptyCell(item)) continue;
+                    if (!first) sb.Append(", ");
+                    sb.Append(Convert.ToString(item, CultureInfo.InvariantCulture));
+                    first = false;
+                }}
+            }}
+            else if (array.Rank == 2)
+            {{
+                for (int r = 0; r < array.GetLength(0); r++)
+                {{
+                    for (int c = 0; c < array.GetLength(1); c++)
+                    {{
+                        object item = array.GetValue(r, c);
+                        if (IsEmptyCell(item)) continue;
+                        if (!first) sb.Append(", ");
+                        sb.Append(Convert.ToString(item, CultureInfo.InvariantCulture));
+                        first = false;
+                    }}
+                }}
+            }}
+
+            sb.Append(']');
+            return sb.ToString();
+        }}
+
+        return Convert.ToString(value, CultureInfo.InvariantCulture);
+    }}
+
+    /// <summary>
+    /// Parses an OpenAI-compatible chat completion response to extract choices[0].message.content.
+    /// </summary>
+    private static string ParseGenAIResult(string json)
+    {{
+        int choicesIdx = json.IndexOf("\\\"choices\\\"");
+        if (choicesIdx < 0)
+            return "Error: No choices in GenAI response";
+
+        int messageIdx = json.IndexOf("\\\"message\\\"", choicesIdx);
+        if (messageIdx < 0)
+            return "Error: No message in GenAI response";
+
+        int contentIdx = json.IndexOf("\\\"content\\\"", messageIdx);
+        if (contentIdx < 0)
+            return "Error: No content in GenAI response";
+
+        int colonIdx = json.IndexOf(':', contentIdx + 9);
+        if (colonIdx < 0)
+            return "Error: Malformed GenAI response";
+
+        int i = colonIdx + 1;
+        while (i < json.Length && char.IsWhiteSpace(json[i])) i++;
+
+        if (i >= json.Length)
+            return "Error: Empty content in GenAI response";
+
+        if (json.Substring(i).StartsWith("null"))
+            return "";
+
+        if (json[i] != '"')
+            return "Error: Unexpected content type in GenAI response";
+
+        var sb = new StringBuilder();
+        bool escape = false;
+        for (int j = i + 1; j < json.Length; j++)
+        {{
+            char ch = json[j];
+            if (escape)
+            {{
+                switch (ch)
+                {{
+                    case 'n': sb.Append('\\n'); break;
+                    case 't': sb.Append('\\t'); break;
+                    case 'r': sb.Append('\\r'); break;
+                    case '"': sb.Append('"'); break;
+                    case '\\\\': sb.Append('\\\\'); break;
+                    case '/': sb.Append('/'); break;
+                    default: sb.Append('\\\\'); sb.Append(ch); break;
+                }}
+                escape = false;
+                continue;
+            }}
+            if (ch == '\\\\')
+            {{
+                escape = true;
+                continue;
+            }}
+            if (ch == '"')
+            {{
+                return sb.ToString();
+            }}
+            sb.Append(ch);
+        }}
+
+        return "Error: Unterminated content string in GenAI response";
     }}
 
     /// <summary>
@@ -1217,6 +1760,8 @@ public static class DominoModelFunctions
     }}
 
 {methods}
+{genai_methods}
+{agent_methods}
 }}
 '''
     return code
@@ -1234,10 +1779,15 @@ def generate_dna_file(project_name: str) -> str:
 '''
 
 
-def build_addin(endpoints: list[EndpointConfig], project_name: str) -> str | None:
+def build_addin(endpoints: list[EndpointConfig], project_name: str,
+                genai_endpoints: list[GenAIEndpointConfig] | None = None,
+                agent_configs: list[AgentUDFConfig] | None = None) -> str | None:
     """Build the Excel-DNA add-in."""
 
-    if not endpoints:
+    genai_endpoints = genai_endpoints or []
+    agent_configs = agent_configs or []
+
+    if not endpoints and not genai_endpoints and not agent_configs:
         print("No endpoints to build. Exiting.")
         return None
 
@@ -1254,13 +1804,20 @@ def build_addin(endpoints: list[EndpointConfig], project_name: str) -> str | Non
     try:
         # Write the C# code
         cs_file = os.path.join(build_dir, "DominoModelFunctions.cs")
+        total_udfs = len(endpoints) + len(genai_endpoints) + len(agent_configs)
         with open(cs_file, "w") as f:
-            f.write(generate_csharp_code(endpoints, project_name))
-        print(f"[2/6] Generated C# source code with {len(endpoints)} UDF(s):")
+            f.write(generate_csharp_code(endpoints, project_name, genai_endpoints, agent_configs))
+        print(f"[2/6] Generated C# source code with {total_udfs} UDF(s):")
         for ep in endpoints:
             params = ", ".join([p["name"] for p in ep.parameters])
             function_name = f"Domino.{project_name}.{ep.name}" if project_name else f"Domino.{ep.name}"
             print(f"       - {function_name}({params})")
+        for ep in genai_endpoints:
+            function_name = f"Domino.{project_name}.{ep.name}" if project_name else f"Domino.{ep.name}"
+            print(f"       - {function_name}(prompt, additional_context) [GenAI]")
+        for agent in agent_configs:
+            function_name = f"Domino.{project_name}.{agent.function_name}" if project_name else f"Domino.{agent.function_name}"
+            print(f"       - {function_name}(prompt, additional_context) [Agent]")
 
         # Write the .dna file
         dna_file = os.path.join(build_dir, "DominoModelFunctions.dna")
@@ -1363,7 +1920,7 @@ def build_addin(endpoints: list[EndpointConfig], project_name: str) -> str | Non
         cs_output = os.path.join(os.getcwd(), "DominoModelFunctions.cs")
         dna_output = os.path.join(os.getcwd(), "DominoModelFunctions.dna")
         with open(cs_output, "w") as f:
-            f.write(generate_csharp_code(endpoints, project_name))
+            f.write(generate_csharp_code(endpoints, project_name, genai_endpoints, agent_configs))
         with open(dna_output, "w") as f:
             f.write(generate_dna_file(project_name))
 
@@ -1385,6 +1942,16 @@ def build_addin(endpoints: list[EndpointConfig], project_name: str) -> str | Non
             function_name = f"Domino.{project_name}.{ep.name}" if project_name else f"Domino.{ep.name}"
             print(f"  ={function_name}({params})")
             print(f"    {ep.description[:70]}...")
+            print()
+        for ep in genai_endpoints:
+            function_name = f"Domino.{project_name}.{ep.name}" if project_name else f"Domino.{ep.name}"
+            print(f"  ={function_name}(prompt, additional_context)")
+            print(f"    {ep.description[:70]}...")
+            print()
+        for agent in agent_configs:
+            function_name = f"Domino.{project_name}.{agent.function_name}" if project_name else f"Domino.{agent.function_name}"
+            print(f"  ={function_name}(prompt, additional_context)")
+            print(f"    {agent.description[:70]}...")
             print()
 
         artifacts_dir = "/mnt/artifacts"
@@ -1409,8 +1976,35 @@ def build_addin(endpoints: list[EndpointConfig], project_name: str) -> str | Non
         shutil.rmtree(build_dir, ignore_errors=True)
 
 
+def _parse_bool(val: str) -> bool:
+    """Parse a boolean string from Domino Launcher (handles quoted 'true'/'false')."""
+    return val.strip().strip("'\"").lower() == "true"
+
+
 def main():
     """Main entry point - discover endpoints and build add-in."""
+
+    # Parse command-line arguments (from Domino Launcher checkboxes)
+    parser = argparse.ArgumentParser(description="Domino Endpoint UDF Add-in Generator")
+    parser.add_argument("include_narrate", nargs="?", default="true",
+                        help="Include Narrate agent UDF (true/false)")
+    parser.add_argument("include_explain_delta", nargs="?", default="true",
+                        help="Include ExplainDelta agent UDF (true/false)")
+    parser.add_argument("include_uncover", nargs="?", default="true",
+                        help="Include Uncover agent UDF (true/false)")
+    parser.add_argument("include_speculate", nargs="?", default="true",
+                        help="Include Speculate agent UDF (true/false)")
+    parser.add_argument("include_parrot", nargs="?", default="true",
+                        help="Include Parrot agent UDF (true/false)")
+    args = parser.parse_args()
+
+    enabled_agents = {
+        "narrate": _parse_bool(args.include_narrate),
+        "explain_delta": _parse_bool(args.include_explain_delta),
+        "uncover": _parse_bool(args.include_uncover),
+        "speculate": _parse_bool(args.include_speculate),
+        "parrot": _parse_bool(args.include_parrot),
+    }
 
     print("=" * 60)
     print("Domino Model APIs - Combined Endpoint Discovery & Add-in Generator")
@@ -1436,9 +2030,47 @@ def main():
     # Step 1: Discover endpoints
     print("Step 1: Discovering model endpoints...")
     print("-" * 40)
-    endpoints = discover_endpoints(project_id, project_name)
+    endpoints, genai_from_models = discover_endpoints(project_id, project_name)
 
-    if not endpoints:
+    print()
+    print("Step 1b: Discovering GenAI app endpoints...")
+    print("-" * 40)
+    genai_from_apps = discover_genai_endpoints(project_id, project_name)
+
+    # Merge gen-AI endpoints from both sources (model discovery + app discovery)
+    genai_endpoints = genai_from_models + genai_from_apps
+
+    # Step 1c: Build agent UDFs from enabled agents
+    agent_configs = []
+    if genai_endpoints:
+        target_genai = genai_endpoints[0]
+        any_enabled = any(enabled_agents.values())
+        if any_enabled:
+            print()
+            print("Step 1c: Configuring agent UDFs...")
+            print("-" * 40)
+            for agent_key, agent_def in AGENTS.items():
+                if not enabled_agents.get(agent_key, False):
+                    print(f"    Skipped: {agent_def['display_name']} (disabled)")
+                    continue
+                agent_cfg = AgentUDFConfig(
+                    function_name=agent_def["function_name"],
+                    display_name=agent_def["display_name"],
+                    system_prompt=agent_def["system"],
+                    temperature=agent_def["temperature"],
+                    max_tokens=agent_def["max_tokens"],
+                    base_url=target_genai.base_url,
+                    description=f"AI agent: {agent_def['display_name']} - powered by {target_genai.name}",
+                )
+                agent_configs.append(agent_cfg)
+                excel_name = f"Domino.{project_name}.{agent_cfg.function_name}" if project_name else f"Domino.{agent_cfg.function_name}"
+                print(f"    Agent: {excel_name}(prompt, additional_context)")
+    else:
+        if any(enabled_agents.values()):
+            print()
+            print("  Note: Agent UDFs requested but no GenAI endpoint found. Skipping agents.")
+
+    if not endpoints and not genai_endpoints and not agent_configs:
         print()
         print("No valid endpoints discovered. Check that:")
         print("  - The project has deployed models with active versions")
@@ -1446,8 +2078,9 @@ def main():
         print("  - Your API key has access to view the models")
         return
 
+    total = len(endpoints) + len(genai_endpoints) + len(agent_configs)
     print()
-    print(f"Discovered {len(endpoints)} endpoint(s)")
+    print(f"Discovered {total} endpoint(s) ({len(endpoints)} model, {len(genai_endpoints)} GenAI, {len(agent_configs)} agent)")
     print()
 
     # Step 2: Build the add-in
@@ -1455,7 +2088,7 @@ def main():
     print("-" * 40)
 
     try:
-        build_addin(endpoints, project_name)
+        build_addin(endpoints, project_name, genai_endpoints, agent_configs)
     except Exception as e:
         print(f"\nBuild Error: {e}")
         print("\nTroubleshooting:")
@@ -1467,7 +2100,7 @@ def main():
         cs_output = os.path.join(os.getcwd(), "DominoModelFunctions.cs")
         dna_output = os.path.join(os.getcwd(), "DominoModelFunctions.dna")
         with open(cs_output, "w") as f:
-            f.write(generate_csharp_code(endpoints, project_name))
+            f.write(generate_csharp_code(endpoints, project_name, genai_endpoints, agent_configs))
         with open(dna_output, "w") as f:
             f.write(generate_dna_file(project_name))
         print(f"Fallback files written:")
